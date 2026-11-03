@@ -1,0 +1,27 @@
+{
+  "name": "wa-directory-bot",
+  "version": "1.0.0",
+  "description": "WhatsApp webhook handler for wa.directory",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    }
+  },
+  "scripts": {
+    "build": "tsc --project ."
+  },
+  "dependencies": {
+    "@supabase/supabase-js": "^2.45.0",
+    "@wa-directory/shared": "file:../wa-directory-shared"
+  },
+  "devDependencies": {
+    "@types/node": "^20.14.0",
+    "typescript": "^5.5.0"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}
