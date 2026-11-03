@@ -11,11 +11,12 @@
     }
   },
   "scripts": {
-    "build": "tsc --project ."
+    "build": "tsc --project .",
+    "prepare": "tsc --project ."
   },
   "dependencies": {
     "@supabase/supabase-js": "^2.45.0",
-    "@wa-directory/shared": "file:../wa-directory-shared"
+    "@wa-directory/shared": "github:pnyanguwo-cyber/wa-directory-shared"
   },
   "devDependencies": {
     "@types/node": "^20.14.0",
