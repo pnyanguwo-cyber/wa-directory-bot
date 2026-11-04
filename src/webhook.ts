@@ -86,7 +86,7 @@ import { validatePhone } from '@wa-directory/shared'
 import { getApprovedCategories, getApprovedAreas, matchCategoryAgainst } from '@wa-directory/shared'
 import { searchPayBusinesses, type PayBusiness } from '@wa-directory/shared'
 import { createListingPayment, paymentAmountFor } from '@wa-directory/shared'
-import { normalizeEcoCashPhone } from '@wa-directory/shared'
+import { normalizeEcoCashPhone, initiateEcoCashPayment, logPaymentEvent, type PaymentAdapters } from '@wa-directory/shared'
 import { PLAN_CONFIG, PERSONAL_PLAN_CONFIG } from '@wa-directory/shared'
 import type { PlanType } from '@wa-directory/shared'
 import { SITE_URL } from '@wa-directory/shared'
@@ -447,6 +447,17 @@ function logOut(to: string, kind: string, body: string) {
 async function sendWhatsAppMessage(to: string, message: string, replyTo?: string) {
   logOut(to, 'text', message)
   return sendWhatsAppText(to, message, replyTo)
+}
+
+// Payment adapters so the shared listing-pay engine can fire the real EcoCash
+// push and log events from inside the bot. sendWhatsAppMessage here is the
+// transcript-logging local wrapper, NOT the shared one.
+function buildPaymentAdapters(): PaymentAdapters {
+  return {
+    initiateEcoCashPayment,
+    logPaymentEvent,
+    sendWhatsAppMessage: (phone, text) => sendWhatsAppMessage(phone, text),
+  }
 }
 
 async function sendInteractiveList(
@@ -1693,12 +1704,15 @@ async function tryPublishContact(
 
   if (msgId) await sendReaction(from, msgId, '✅').catch(() => {})
 
-  const pay = await createListingPayment({
-    businessId: result.businessId,
-    payerPhone: from,
-    plan,
-    amountOverride: payAmount,
-  })
+  const pay = await createListingPayment(
+    {
+      businessId: result.businessId,
+      payerPhone: from,
+      plan,
+      amountOverride: payAmount,
+    },
+    buildPaymentAdapters()
+  )
   if (!pay.ok) {
     // The listing exists but payment couldn't start — the admin fallback in
     // the subscription engine still alerts, so tell the user it's queued.
@@ -2462,19 +2476,19 @@ async function handleEcoCashText(from: string, session: ChatSession, text: strin
     return
   }
   const eco = normalizeEcoCashPhone(text.trim())
-  if (!/^0(71|73|77|78)\d{7}$/.test(eco)) {
+  if (!/^0(71|77|78)\d{7}$/.test(eco)) {
     await sendWhatsAppMessage(
       from,
-      `"${text.trim().slice(0, 30)}" doesn't look like an EcoCash number (077… / 078…).\n\nSend the number again, reply *me*, or *cancel*.`
+      `"${text.trim().slice(0, 30)}" doesn't look like an Econet EcoCash number (071… / 077… / 078…).\n\nSend the number again, reply *me*, or *cancel*.`
     )
     return
   }
 
-  const result = await createListingPayment({ businessId: biz.id, payerPhone: eco, plan })
+  const result = await createListingPayment({ businessId: biz.id, payerPhone: eco, plan }, buildPaymentAdapters())
   const amount = paymentAmountFor(plan)
   if (!result.ok) {
     if (result.error === 'Invalid payer phone number') {
-      await sendWhatsAppMessage(from, "That number didn't look right — try again (077… / 078…) or reply *me*.")
+      await sendWhatsAppMessage(from, "That number didn't look right — try again (071… / 077… / 078…) or reply *me*.")
       return
     }
     // Business-state errors terminate the flow cleanly.
