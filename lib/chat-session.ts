@@ -58,6 +58,13 @@ export interface ChatSessionData {
   pay_business?: { id: string; name: string }
   // Plan chosen at the pay_plan step.
   pay_plan?: '1m' | '6m' | '12m'
+  // Amount override for special pricing (personal contacts bill the
+  // PERSONAL_PLAN_CONFIG rates, not the business plan). Carried into
+  // createListingPayment as amountOverride.
+  pay_amount?: number
+  // Edit token of a just-created contact/listing; after the EcoCash prompt
+  // completes, the success outro hands the user their edit link.
+  pay_token?: string
   // ── Need intake (S16 matchmaking) ──────────────────────────────────
   // Living need draft: what, how many, budget hint, town.
   need?: { item: string; qty: string; budget: string; city: string }

@@ -1617,7 +1617,6 @@ async function tryPublishContact(
   // $1/month, $5/6 months, $10/year. The amount override rides through to
   // createListingPayment so the subscription + EcoCash request use it directly.
   const payAmount = amount ?? PERSONAL_PLAN_CONFIG[plan].price
-  const labelMonths = PERSONAL_PLAN_CONFIG[plan].label.toLowerCase()
   const c = session.data.contact!
   const rawName = c.name
   const rawPhone = c.phone.replace(/[^0-9]/g, '')
@@ -1702,48 +1701,18 @@ async function tryPublishContact(
     return
   }
 
+  // Ask which EcoCash number gets the PIN prompt BEFORE pushing the payment —
+  // the payer may be a different number than this chat (reply *me* bills the
+  // chat's own number). The pay_ecocash flow carries the edit token + personal
+  // amount override and hands back the edit link with the bill confirmation.
   if (msgId) await sendReaction(from, msgId, '✅').catch(() => {})
-
-  const pay = await createListingPayment(
-    {
-      businessId: result.businessId,
-      payerPhone: from,
-      plan,
-      amountOverride: payAmount,
-    },
-    buildPaymentAdapters()
-  )
-  if (!pay.ok) {
-    // The listing exists but payment couldn't start — the admin fallback in
-    // the subscription engine still alerts, so tell the user it's queued.
-    await sendWhatsAppMessage(
-      from,
-      [
-        `✅ *${result.name}* — Personal contact was saved.`,
-        '',
-        `The USD ${payAmount.toFixed(2)} payment could not start right now. Our team will confirm it and your contact will go live.`,
-      ].join('\n')
-    )
-    await clearSession(from)
-    return
-  }
-  await sendWhatsAppMessage(
+  await askEcoCashNumber(
     from,
-    [
-      `✅ *${result.name}* — Personal contact`,
-      '',
-      `💸 USD ${payAmount.toFixed(2)} · ${labelMonths} · EcoCash`,
-      pay.autoEcoCash
-        ? pay.message
-        : pay.message + ' (goes live once confirmed — usually within minutes).',
-      '',
-      'Save your edit link:',
-      `${SITE_URL}/edit?token=${result.editToken}`,
-      '',
-      'Reply *help* anytime.',
-    ].join('\n')
+    { id: result.businessId, name: result.name },
+    plan,
+    { pay_token: result.editToken },
+    payAmount
   )
-  await clearSession(from)
 }
 
 // The living form: renders the current fill state; the interactive row below
@@ -2453,16 +2422,25 @@ async function askEcoCashNumber(
   from: string,
   biz: { id: string; name: string } | undefined,
   plan: PlanType,
-  base: ChatSessionData = {}
+  base: ChatSessionData = {},
+  amount?: number
 ) {
   if (!biz) {
     await startPayChoice(from)
     return
   }
-  await saveSession(from, 'pay_ecocash', { ...base, pay_business: biz, pay_plan: plan } as ChatSessionData)
-  const amount = paymentAmountFor(plan)
+  // Personal contacts bill the override (PERSONAL_PLAN_CONFIG) rate; plain
+  // listings use the plan's business price.
+  const amountOverride = amount ?? base.pay_amount
+  await saveSession(from, 'pay_ecocash', {
+    ...base,
+    pay_business: biz,
+    pay_plan: plan,
+    pay_amount: amountOverride,
+  } as ChatSessionData)
+  const total = amountOverride ?? paymentAmountFor(plan)
   await sendWhatsAppMessage(from, [
-    `${PLAN_CONFIG[plan].label} · $${amount.toFixed(2)} for *${biz.name}* (${biz.id})`,
+    `${PLAN_CONFIG[plan].label} · $${total.toFixed(2)} for *${biz.name}* (${biz.id})`,
     '',
     "Which EcoCash number should get the PIN prompt? e.g. *0771 234 567* — or reply *me* (this chat's number).",
   ].join('\n'))
@@ -2475,17 +2453,23 @@ async function handleEcoCashText(from: string, session: ChatSession, text: strin
     await startPayChoice(from)
     return
   }
-  const eco = normalizeEcoCashPhone(text.trim())
+  const raw = text.trim()
+  // *me* = bill this chat's own WhatsApp number.
+  const eco = normalizeEcoCashPhone(/^me$/i.test(raw) ? from : raw)
   if (!/^0(71|77|78)\d{7}$/.test(eco)) {
     await sendWhatsAppMessage(
       from,
-      `"${text.trim().slice(0, 30)}" doesn't look like an Econet EcoCash number (071… / 077… / 078…).\n\nSend the number again, reply *me*, or *cancel*.`
+      `"${raw.slice(0, 30)}" doesn't look like an Econet EcoCash number (071… / 077… / 078…).\n\nSend the number again, reply *me*, or *cancel*.`
     )
     return
   }
 
-  const result = await createListingPayment({ businessId: biz.id, payerPhone: eco, plan }, buildPaymentAdapters())
-  const amount = paymentAmountFor(plan)
+  // Personal contacts pay the override rate; plain listings the plan price.
+  const amount = session.data.pay_amount ?? paymentAmountFor(plan)
+  const result = await createListingPayment(
+    { businessId: biz.id, payerPhone: eco, plan, amountOverride: session.data.pay_amount },
+    buildPaymentAdapters()
+  )
   if (!result.ok) {
     if (result.error === 'Invalid payer phone number') {
       await sendWhatsAppMessage(from, "That number didn't look right — try again (071… / 077… / 078…) or reply *me*.")
@@ -2498,24 +2482,44 @@ async function handleEcoCashText(from: string, session: ChatSession, text: strin
   }
   await clearSession(from)
   if (result.autoEcoCash) {
-    await sendWhatsAppMessage(
-      from,
-      [
-        '💸 *EcoCash prompt sent!*',
-        '',
-        `Check your phone for the $${amount.toFixed(2)} PIN request (${PLAN_CONFIG[plan].label} plan for *${biz.name}*).`,
-        'Enter your PIN and the listing goes live automatically —',
-        "I'll message you here the moment it does.",
-      ].join('\n')
-    )
+    if (session.data.pay_token) {
+      // Personal contact: hand over the edit link with the bill confirmation.
+      await sendWhatsAppMessage(
+        from,
+        [
+          `✅ *${biz.name}* — Personal contact`,
+          '',
+          `💸 USD ${amount.toFixed(2)} · ${PERSONAL_PLAN_CONFIG[plan].label} · EcoCash prompt sent to ${eco}.`,
+          'Enter your PIN and it goes live automatically — I\'ll message you here the moment it does.',
+          '',
+          'Save your edit link:',
+          `${SITE_URL}/edit?token=${session.data.pay_token}`,
+          '',
+          'Reply *help* anytime.',
+        ].join('\n')
+      )
+    } else {
+      await sendWhatsAppMessage(
+        from,
+        [
+          '💸 *EcoCash prompt sent!*',
+          '',
+          `Check your phone for the $${amount.toFixed(2)} PIN request (${PLAN_CONFIG[plan].label} plan for *${biz.name}*).`,
+          'Enter your PIN and the listing goes live automatically —',
+          "I'll message you here the moment it does.",
+        ].join('\n')
+      )
+    }
   } else {
     await sendWhatsAppMessage(
       from,
       [
         '📝 *Payment request logged* — nothing charged yet.',
         '',
-        `${PLAN_CONFIG[plan].label} plan · $${amount.toFixed(2)} for *${biz.name}*.`,
-        'Our team verifies the EcoCash transaction and the listing goes live right after.',
+        `${session.data.pay_token ? PERSONAL_PLAN_CONFIG[plan].label : PLAN_CONFIG[plan].label} · $${amount.toFixed(2)} for *${biz.name}*.`,
+        session.data.pay_token
+          ? 'Our team verifies the EcoCash transaction and your contact goes live right after.'
+          : 'Our team verifies the EcoCash transaction and the listing goes live right after.',
         `Prefer paying right now? ${SITE_URL}/pay`,
       ].join('\n')
     )
@@ -5636,7 +5640,7 @@ async function publishBusiness(from: string, session: ChatSession, msgId?: strin
       'Once an admin approves it you will get a confirmation here.',
       '',
       result.pendingPayment
-        ? '💵 To go live: pay USD 1 — link: ' + SITE_URL + '/pay (manual confirmation; EcoCash on WhatsApp is coming soon)'
+        ? '💵 To go live: pay USD 1 — I will ask for your EcoCash number next (or pay at ' + SITE_URL + '/pay)'
         : '⭐ Public-service listing: our team verifies it fast.',
       '',
       '📸 *After go-live:* send a product photo with a caption that includes the product name and price (e.g. *bread $2*), and you can add extra details like *\"i make home deliveries and customize cakes to your liking\"*.',
@@ -5656,6 +5660,13 @@ async function publishBusiness(from: string, session: ChatSession, msgId?: strin
       'Reply *help* anytime.',
     ].join('\n')
   )
+
+  // Pay now from chat: ask which EcoCash number gets the PIN prompt (the
+  // payer's own number or *me* for this chat), push the Paynow EcoCash
+  // request, and let /api/paynow/result auto-confirm — no admin step.
+  if (result.pendingPayment) {
+    await askEcoCashNumber(from, { id: result.businessId, name }, '1m')
+  }
 
   // One-time channel pitch while the registration window is open: this is
   // where live buyer needs surface, and quoting is one reply.
