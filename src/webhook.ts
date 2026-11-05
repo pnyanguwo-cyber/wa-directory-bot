@@ -2511,6 +2511,7 @@ async function handleEcoCashText(from: string, session: ChatSession, text: strin
       )
     }
   } else {
+    console.log(`[ecocash-diag] autoEcoCash=false biz=${biz.id} paynowId=${!!process.env.PAYNOW_INTEGRATION_ID} paynowKey=${!!process.env.PAYNOW_INTEGRATION_KEY}`)
     await sendWhatsAppMessage(
       from,
       [
