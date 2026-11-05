@@ -2540,8 +2540,16 @@ async function startPaySearch(from: string) {
 
 async function handlePaySearchText(from: string, session: ChatSession, text: string) {
   const lower = text.toLowerCase().trim()
-  if (/^(?:register|list me|list my|list on|get listed|add my business|sign me up)\b/.test(lower) || lower === 'list') {
-    await startRegister(from)
+  const mReg = text
+    .trim()
+    .match(/^(register|list me|list my|list on|list|get listed|add my business|sign me up)\b(.*)$/i)
+  if (mReg) {
+    const trailing = mReg[2].trim()
+    if (!trailing || /^(?:me|my business|my company|my shop|myself|us)$/i.test(trailing)) {
+      await sendRegisterChoice(from)
+    } else {
+      await startRegister(from, trailing)
+    }
     return
   }
   if (lower === 'menu' || lower === 'hi' || lower === 'hello') {
@@ -6442,8 +6450,16 @@ export async function POST(request: Request) {
           continue
         }
 
-        if (/^(register|list me|list my|list on|get listed|add my business|sign me up|advertise\b|sell\b.*\b(list|advertise|get listed)\b|i want to (list|sell|advertise)|join\b)\b/.test(lower) || lower === 'list') {
-          await startRegister(from, text)
+        const mReg = text
+          .trim()
+          .match(/^(register|list me|list my|list on|list|get listed|add my business|sign me up|advertise\b|sell\b.*\b(list|advertise|get listed)\b|i want to (list|sell|advertise)|join\b)\b(.*)$/i)
+        if (mReg) {
+          const trailing = mReg[3].trim()
+          if (!trailing || /^(?:me|my business|my company|my shop|myself|us)$/i.test(trailing)) {
+            await sendRegisterChoice(from)
+          } else {
+            await startRegister(from, trailing)
+          }
           continue
         }
 
