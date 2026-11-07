@@ -1,4 +1,4 @@
-﻿import crypto from 'node:crypto'
+import crypto from 'node:crypto'
 import {
   sendWhatsAppMessage as sendWhatsAppText,
   sendInteractiveList as sendInteractiveListRaw,
@@ -83,7 +83,7 @@ import { curatedRelatedTerms } from '@wa-directory/shared'
 import { slugify } from '@wa-directory/shared'
 import { zimbabweCities } from '@wa-directory/shared'
 import { validatePhone } from '@wa-directory/shared'
-import { getApprovedCategories, getApprovedAreas, matchCategoryAgainst } from '@wa-directory/shared'
+import { getApprovedCategories, getApprovedAreas, matchCategoryAgainst, matchCategoryLearned, findCityLearned, findAreaLearned } from '@wa-directory/shared'
 import { searchPayBusinesses, type PayBusiness } from '@wa-directory/shared'
 import { createListingPayment, paymentAmountFor } from '@wa-directory/shared'
 import { normalizeEcoCashPhone, initiateEcoCashPayment, logPaymentEvent, type PaymentAdapters } from '@wa-directory/shared'
@@ -332,7 +332,7 @@ function contactChunkMessages(
 ): string[] {
   const lines = rows.map((r, i) => {
     const num = formatPhone(r.phone) || 'no number'
-    return `${startIndex + i + 1}. *${r.name}* · ${r.city || '—'} · ${num}${r.phoneType === 'voice' ? ' 📞' : ''}`
+    return `${startIndex + i + 1}. *${r.name}* · ${r.city || '-'} · ${num}${r.phoneType === 'voice' ? ' 📞' : ''}`
   })
   if (lines.length === 0) return []
   const pageSize = 38
@@ -699,7 +699,7 @@ async function handleRatingReply(from: string, session: ChatSession | null, text
   }
 
   const rating = Number(match[1])
-  const comment = text.trim().slice(match[0].length).trim().replace(/^[-–—:.]\s*/, '')
+  const comment = text.trim().slice(match[0].length).trim().replace(/^[\u2014\u2013\-:.]\s*/, '')
 
   // Portal review display gets richer when we know the customer's name
   // (captured from their WhatsApp profile during conversations).
@@ -1040,7 +1040,7 @@ async function startFreshSearchPrompt(from: string) {
 // the pricing hook lives in the row description.
 const MENU_ROWS = [
   { id: 'menu_needs', title: '🛒 Post a need', description: 'Suppliers quote you here' },
-  { id: 'menu_order', title: '🧺 Order items', description: 'Type items — sent shop by shop' },
+  { id: 'menu_order', title: '🧺 Order items', description: 'Type items - sent shop by shop' },
   { id: 'menu_register', title: '✎ Register', description: 'Business $1/mo · Personal $1/mo' },
   { id: 'menu_pay', title: '$ Pay (EcoCash)', description: 'Pay or top up via EcoCash' },
   { id: 'menu_help', title: '✆ Help', description: 'Tips & support' },
@@ -1086,7 +1086,7 @@ async function sendWizardQuestion(
   let body = [wizardProgress(index), '', note ? `${note}\n` : '', step.prompt].filter(Boolean).join('\n')
   // Add context note for area step if whole_country was selected
   if (step.key === 'area' && state.whole_country) {
-    body += '\n\n_You selected "whole country" — this step is optional and can be skipped._'
+    body += '\n\n_You selected "whole country" - this step is optional and can be skipped._'
   }
   const buttons: InteractiveButton[] = []
   if (step.optional) buttons.push({ id: 'list_skip', title: '⏭ Skip' })
@@ -1121,12 +1121,12 @@ async function wizardAdvance(
     await sendWhatsAppImage(
       from,
       'https://images.unsplash.com/photo-1509440159596-0249088772ff',
-      '📦 *How to list your products & prices*\n\nOnce your business goes live, you can add products to your shop shelf anytime by sending a photo with a caption that includes the product name and price, e.g.:\n\n*bread $2*\n*cake $15*\n\nYou can also add extra details in the caption like *\"i make home deliveries and customize cakes to your liking\"*.\n\nProducts without photos are fully accepted too!\n\n📸 *Photo tips:* While optional, we strongly recommend uploading original photos of your actual products — this builds customer trust. Please avoid internet-sourced or AI-generated images. If we detect non-original images, they may be removed.'
+      '📦 *How to list your products & prices*\n\nOnce your business goes live, you can add products to your shop shelf anytime by sending a photo with a caption that includes the product name and price, e.g.:\n\n*bread $2*\n*cake $15*\n\nYou can also add extra details in the caption like *\"i make home deliveries and customize cakes to your liking\"*.\n\nProducts without photos are fully accepted too!\n\n📸 *Photo tips:* While optional, we strongly recommend uploading original photos of your actual products - this builds customer trust. Please avoid internet-sourced or AI-generated images. If we detect non-original images, they may be removed.'
     )
     await sendFormUpdate(
       from,
       state,
-      "That's all the questions ✅ — check your listing above, then tap *↗ Publish* to go live."
+      "That's all the questions ✅ - check your listing above, then tap *↗ Publish* to go live."
     )
     return
   }
@@ -1154,7 +1154,7 @@ async function handleListWizardTextInternal(from: string, session: ChatSession, 
         from,
         before,
         idx,
-        `We need the ${step.label.toLowerCase()} to publish — please answer it, or reply *cancel* to stop.`
+        `We need the ${step.label.toLowerCase()} to publish - please answer it, or reply *cancel* to stop.`
       )
       return
     }
@@ -1190,17 +1190,30 @@ async function handleListWizardTextInternal(from: string, session: ChatSession, 
       state = applyListingFields(state, { whole_country: true }, from)
     } else if (/remote/i.test(text)) {
       state = applyListingFields(state, { city: 'remote', whole_country: false }, from)
+    } else if (!state.city && !state.whole_country) {
+      const typed = text.trim().replace(/\s+/g, ' ')
+      if (!text.includes('\n') && typed.length >= 2 && typed.length <= 40 && /[a-z]/i.test(typed)) {
+        state = applyListingFields(state, { city: findCity(typed) || typed, whole_country: false }, from)
+      }
+    }
+  }
+  if (step.key === 'area') {
+    if (!state.area) {
+      const typed = text.trim().replace(/\s+/g, ' ')
+      if (typed.length >= 2 && typed.length <= 80 && /^[a-z0-9 ,.'\-()/]+$/i.test(typed)) {
+        state = applyListingFields(state, { area: typed }, from)
+      }
     }
   }
 
   await saveSession(from, 'list_form', { ...session.data, list: state, wizard: idx } as ChatSessionData)
 
   if (!wizardStepAnswered(state, step.key)) {
-    let note = `Hmm, I couldn't read that as ${step.label.toLowerCase()} — please try again.`
+    let note = `Hmm, I couldn't read that as ${step.label.toLowerCase()} - please try again.`
     if (step.key === 'city') {
-      note = "I don't know that town — try again, e.g. *Masvingo*, or reply *whole country* or *remote*."
+      note = "That doesn't look like a town name - try again, e.g. *Masvingo*, or reply *whole country* or *remote*."
     } else if (step.key === 'categories') {
-      note = "I don't know that category — try a common one, e.g. *Salon*, *Bakery*, *Electrician*, *Hardware*."
+      note = "I don't know that category - try a common one, e.g. *Salon*, *Bakery*, *Electrician*, *Hardware*."
     } else if (step.key === 'phone') {
       note = "Hmm, I couldn't read that as a phone number. Only Zimbabwean numbers are accepted (e.g. 077, 078, 071, 073, 075). Send it again, or reply *me* to use this WhatsApp number."
     }
@@ -1296,7 +1309,7 @@ async function handleIntentPivot(
     ({ step: session.step, data: session.data, at: new Date().toISOString() } as PausedDraft)
   const hadDraft = hasProgress(session.data)
   const ack = hadDraft
-    ? "No problem — plans have changed 👍\nI've set what you were doing aside; reply *resume* to pick it up again."
+    ? "No problem - plans have changed 👍\nI've set what you were doing aside; reply *resume* to pick it up again."
     : ''
   const say = async (line: string) => {
     if (line) await sendWhatsAppMessage(from, line)
@@ -1309,7 +1322,7 @@ async function handleIntentPivot(
       if (shelvedFresh && familyOf(shelvedFresh.step) === 'register') {
         await sendWhatsAppMessage(
           from,
-          'No problem — plans have changed 👍\n\nYou left a registration part-way through. Continue it, or start over?'
+          'No problem - plans have changed 👍\n\nYou left a registration part-way through. Continue it, or start over?'
         )
         await sendInteractiveButtons(from, '', [
           { id: 'resume_paused', title: '▶ Continue my draft' },
@@ -1473,7 +1486,7 @@ async function resumePaused(from: string, session: ChatSession | null): Promise<
           { id: 'oedit', title: '✎ Re-type' },
         ])
       } else {
-        await sendWhatsAppMessage(from, `${head} Send your order again — e.g. *order 2 bread, 1 cake*.`)
+        await sendWhatsAppMessage(from, `${head} Send your order again - e.g. *order 2 bread, 1 cake*.`)
       }
       return true
     case 'rating':
@@ -1516,8 +1529,8 @@ async function sendRegisterChoice(from: string) {
     [
       '✎ *Registering on WA Directory*',
       '',
-      '• Business subscription — USD 1 per month',
-      '• Personal contact — $1/month, $5/6 months or $10/year',
+      '• Business subscription - USD 1 per month',
+      '• Personal contact - $1/month, $5/6 months or $10/year',
       '',
       'Which are you adding?',
     ].join('\n'),
@@ -1646,7 +1659,7 @@ async function tryPublishContact(
         'You already have 3 active personal contacts 📱',
         '',
         'That is the limit per person. If you are registering a business,',
-        'tap ✎ Register and choose *Business* — USD 1 per month, no cap.',
+        'tap ✎ Register and choose *Business* - USD 1 per month, no cap.',
       ].join('\n')
     )
     await clearSession(from)
@@ -1673,7 +1686,7 @@ async function tryPublishContact(
       from,
       [
         `*+263${listedDigits}* is already registered as a business listing`,
-        `(*${bizBlock.name}*) — personal contacts are for people, not companies.`,
+        `(*${bizBlock.name}*) - personal contacts are for people, not companies.`,
         '',
         'If that is you: renew it for USD 1/month (send *pay*), or register a',
         'different number for the personal contact.',
@@ -1786,9 +1799,9 @@ async function handleListFormText(from: string, session: ChatSession, text: stri
     ['name', 'categories', 'city', 'area', 'phone', 'price_range', 'website', 'catalog', 'address', 'description', 'username']
       .some(k => JSON.stringify((state as Record<string, unknown>)[k]) !== JSON.stringify((before as Record<string, unknown>)[k]))
   const tail = !filledAny
-    ? "I couldn't match that to a field yet — send e.g. *name …*, *city …*, *phone …*, or a description."
+    ? "I couldn't match that to a field yet - send e.g. *name …*, *city …*, *phone …*, or a description."
     : missing.length === 0
-      ? 'All mandatory fields are set — tap ↗ Publish to submit.'
+      ? 'All mandatory fields are set - tap ↗ Publish to submit.'
       : `${missing.length} mandatory field${missing.length > 1 ? 's' : ''} still missing: ${missing.join(', ')}.`
   const priceNudge =
     filledAny && isSinglePriceRange(state.price_range)
@@ -1879,10 +1892,10 @@ async function startShelfItem(
     const ok = await insertShelfItem(biz.id, spec, imageUrl)
     await clearSession(from)
     if (!ok) {
-      await sendWhatsAppMessage(from, '❌ Could not save that item — try again.', mediaMsgId)
+      await sendWhatsAppMessage(from, '❌ Could not save that item - try again.', mediaMsgId)
       return
     }
-    let response = `🧺 **${spec.name}** at \`$${spec.price}\` stocked on ${biz.name}'s shelf${imageUrl ? ' with the photo' : ''} — it shows in the shop section of the website.`
+    let response = `🧺 **${spec.name}** at \`$${spec.price}\` stocked on ${biz.name}'s shelf${imageUrl ? ' with the photo' : ''} - it shows in the shop section of the website.`
     if (extraDescription) {
       response += `\n\n📝 *Details:*\n> ${extraDescription}`
     }
@@ -1907,7 +1920,7 @@ async function startShelfItem(
   await sendWhatsAppMessage(
     from,
     (imageUrl ? '📷 Photo saved. ' : '') +
-      'Reply with the product name and price to stock it on your shop shelf, e.g. *bread $2*. You can also add extra details in your message like *\"i make home deliveries and customize cakes to your liking\"*. Reply *skip* to not add it.\n\n📸 *Photo tips:* While optional, we strongly recommend uploading original photos of your actual products — this builds customer trust. Please avoid internet-sourced or AI-generated images. If we detect non-original images, they may be removed.',
+      'Reply with the product name and price to stock it on your shop shelf, e.g. *bread $2*. You can also add extra details in your message like *\"i make home deliveries and customize cakes to your liking\"*. Reply *skip* to not add it.\n\n📸 *Photo tips:* While optional, we strongly recommend uploading original photos of your actual products - this builds customer trust. Please avoid internet-sourced or AI-generated images. If we detect non-original images, they may be removed.',
     mediaMsgId
   )
 }
@@ -1918,7 +1931,7 @@ async function handleItemSpecText(from: string, session: ChatSession, text: stri
   const lower = text.trim().toLowerCase()
   if (lower === 'skip' || lower === 'cancel') {
     await clearSession(from)
-    await sendWhatsAppMessage(from, 'Skipped — the photo was not added to the shelf.')
+    await sendWhatsAppMessage(from, 'Skipped - the photo was not added to the shelf.')
     return
   }
 
@@ -1927,7 +1940,7 @@ async function handleItemSpecText(from: string, session: ChatSession, text: stri
   if (!spec) {
     await sendWhatsAppMessage(
       from,
-      'Reply with the product name and price, e.g. *bread $2*. You can add extra details after. — or *skip* to not add it.'
+      'Reply with the product name and price, e.g. *bread $2*. You can add extra details after. - or *skip* to not add it.'
     )
     return
   }
@@ -1936,7 +1949,7 @@ async function handleItemSpecText(from: string, session: ChatSession, text: stri
   if (!biz) {
     await sendWhatsAppMessage(
       from,
-      'Reply with the product name and price, e.g. *bread $2*. You can add extra details after. — or *skip* to not add it.'
+      'Reply with the product name and price, e.g. *bread $2*. You can add extra details after. - or *skip* to not add it.'
     )
     return
   }
@@ -1944,12 +1957,12 @@ async function handleItemSpecText(from: string, session: ChatSession, text: stri
   const ok = await insertShelfItem(biz.id, spec, imageUrl)
   await clearSession(from)
   if (!ok) {
-    await sendWhatsAppMessage(from, '❌ Could not save that item — try again, e.g. *bread $2*.')
+    await sendWhatsAppMessage(from, '❌ Could not save that item - try again, e.g. *bread $2*.')
     return
   }
 
   // Format the response: bold name, inline-code price, quote extra description
-  let response = `🧺 **${spec.name}** at \`$${spec.price}\` stocked on ${biz.name}'s shelf${imageUrl ? ' with the photo' : ''} — it shows in the shop section of the website.`
+  let response = `🧺 **${spec.name}** at \`$${spec.price}\` stocked on ${biz.name}'s shelf${imageUrl ? ' with the photo' : ''} - it shows in the shop section of the website.`
   if (spec.description) {
     response += `\n\n📝 *Details:*\n> ${spec.description}`
   }
@@ -1996,7 +2009,7 @@ async function handleBotMedia(
     if (session?.step === 'list_form' && kind === 'image') {
       await sendWhatsAppMessage(
         from,
-        "I couldn't read that photo. Keep typing — *name …*, *category …*, *description …* — or tap ↗ Publish when ready.",
+        "I couldn't read that photo. Keep typing - *name …*, *category …*, *description …* - or tap ↗ Publish when ready.",
         mediaMsgId
       )
       return
@@ -2043,7 +2056,7 @@ async function handleBotMedia(
         from,
         state,
         wz!,
-        logoUrl ? "📷 Photo saved — I'll use it as your logo." : "I couldn't read that photo — no problem, let's continue."
+        logoUrl ? "📷 Photo saved - I'll use it as your logo." : "I couldn't read that photo - no problem, let's continue."
       )
       return
     }
@@ -2061,8 +2074,8 @@ async function handleBotMedia(
   const query = [sense.term, sense.city].filter(Boolean).join(' ')
   const echo =
     kind === 'audio'
-      ? `You said: *${query}* — searching…`
-      : `That photo looks like: *${query}* — searching…`
+      ? `You said: *${query}* - searching…`
+      : `That photo looks like: *${query}* - searching…`
   await sendWhatsAppMessage(from, echo, mediaMsgId)
   await dispatchSearch(from, query, { replyTo: mediaMsgId })
 }
@@ -2079,7 +2092,7 @@ async function handleBotLocation(
   if (session?.step === 'search_loc' && session.data.pending_search_term) {
     const term = session.data.pending_search_term
     await clearSession(from)
-    await sendWhatsAppMessage(from, `📍 Got it — searching *${term}* near you…`, mediaMsgId)
+    await sendWhatsAppMessage(from, `📍 Got it - searching *${term}* near you…`, mediaMsgId)
     await runSearchAndReply(
       from,
       { term, city: null, nationwide: false, origin },
@@ -2158,10 +2171,10 @@ async function handleListFormMedia(
 
   await saveSession(from, 'list_form', { list: state } as ChatSessionData)
   const missing = missingRequired(state)
-  const tail = `Photo read${changed.length ? `: ${changed.join(', ')}` : ' — nothing usable, keep typing'}.` +
-    (!logoUrl && !beforeLogo ? ' (Logo not saved — try a clearer shot.)' : '') +
+  const tail = `Photo read${changed.length ? `: ${changed.join(', ')}` : ' - nothing usable, keep typing'}.` +
+    (!logoUrl && !beforeLogo ? ' (Logo not saved - try a clearer shot.)' : '') +
     (missing.length === 0
-      ? ' All mandatory fields set — tap ↗ Publish.'
+      ? ' All mandatory fields set - tap ↗ Publish.'
       : ` Still missing: ${missing.join(', ')}.`)
   await sendFormUpdate(from, state, tail)
 }
@@ -2215,7 +2228,7 @@ async function startPayChoice(from: string) {
   }
   await sendInteractiveButtons(
     from,
-    'What do you want to pay for — a business already in the directory, or a new listing you still need to register?',
+    'What do you want to pay for - a business already in the directory, or a new listing you still need to register?',
     [
       { id: 'pay_existing', title: 'Existing business' },
       { id: 'pay_new', title: 'Register new' },
@@ -2336,12 +2349,12 @@ function renderMyListings(rows: MyListingRow[], onlyPersonal: boolean): string {
   const title = onlyPersonal ? '📇 *Your personal contacts*' : '💳 *Your paid listings*'
   if (!scope.length) {
     return onlyPersonal
-      ? 'No personal contacts yet.\n\nAdd one in seconds — send the name + phone, e.g.\n*Tendai Ncube 0771 234 567 Harare*'  // bot personal-contact intake
+      ? 'No personal contacts yet.\n\nAdd one in seconds - send the name + phone, e.g.\n*Tendai Ncube 0771 234 567 Harare*'  // bot personal-contact intake
       : 'Nothing paid for yet on your number.\n\n• Add a personal contact: send *register* and choose *Personal contact  $1/mo*\n• Check what is live: send *contact*'
   }
   const statusIcon = (r: MyListingRow) =>
     r.status === 'active' ? '🟢' : r.status === 'pending' ? '🟡' : '🔴'
-  const lines = [`${title} — ${scope.length}`, '']
+  const lines = [`${title} - ${scope.length}`, '']
   scope.forEach((r, i) => {
     const bits = [
       statusIcon(r),
@@ -2359,7 +2372,7 @@ function renderMyListings(rows: MyListingRow[], onlyPersonal: boolean): string {
   if (scope.some(r => r.status === 'pending')) {
     lines.push('🟡 awaiting payment? Send *pay* and pick the listing to enter your EcoCash PIN.')
   } else {
-    lines.push(expiringSoon.length ? `⏰ ${expiringSoon.length} winding down soon — renew with *pay*.` : 'Renew any: send *pay*.')
+    lines.push(expiringSoon.length ? `⏰ ${expiringSoon.length} winding down soon - renew with *pay*.` : 'Renew any: send *pay*.')
   }
   return lines.join('\n')
 }
@@ -2370,7 +2383,7 @@ async function sendMyListings(from: string, onlyPersonal: boolean) {
     await sendWhatsAppMessage(from, renderMyListings(rows, onlyPersonal))
   } catch (err) {
     console.error('[webhook] my listings query failed:', err)
-    await sendWhatsAppMessage(from, 'Could not load your listings right now — please try again in a moment.')
+    await sendWhatsAppMessage(from, 'Could not load your listings right now - please try again in a moment.')
   }
 }
 
@@ -2388,13 +2401,13 @@ async function assertPayableBusiness(
   ])
   if (!biz) return { ok: false, reply: "That business isn't in the directory anymore." }
   if (biz.payment_status === 'active') {
-    return { ok: false, reply: `*${biz.name}* is already live — no payment needed.` }
+    return { ok: false, reply: `*${biz.name}* is already live - no payment needed.` }
   }
   if (
     Array.isArray(biz.category) &&
     biz.category.some((c: string) => (specialCats || []).some(sc => sc.name === c))
   ) {
-    return { ok: false, reply: `*${biz.name}* is a Yellow Pages listing — free forever, nothing to pay.` }
+    return { ok: false, reply: `*${biz.name}* is a Yellow Pages listing - free forever, nothing to pay.` }
   }
   return { ok: true, name: biz.name, waId: businessId }
 }
@@ -2409,7 +2422,7 @@ async function beginPayPlan(from: string, cand: { id: string; name: string }) {
   await saveSession(from, 'pay_plan', { pay_business: { id: guard.waId, name: guard.name } } as ChatSessionData)
   await sendInteractiveButtons(
     from,
-    `*${guard.name}* (${guard.waId}) — which plan covers the listing?`,
+    `*${guard.name}* (${guard.waId}) - which plan covers the listing?`,
     [
       { id: 'pay_1m', title: `1 Month · $${PLAN_CONFIG['1m'].price.toFixed(0)}` },
       { id: 'pay_6m', title: `6 Months · $${PLAN_CONFIG['6m'].price.toFixed(0)}` },
@@ -2442,7 +2455,7 @@ async function askEcoCashNumber(
   await sendWhatsAppMessage(from, [
     `${PLAN_CONFIG[plan].label} · $${total.toFixed(2)} for *${biz.name}* (${biz.id})`,
     '',
-    "Which EcoCash number should get the PIN prompt? e.g. *0771 234 567* — or reply *me* (this chat's number).",
+    "Which EcoCash number should get the PIN prompt? e.g. *0771 234 567* - or reply *me* (this chat's number).",
   ].join('\n'))
 }
 
@@ -2472,7 +2485,7 @@ async function handleEcoCashText(from: string, session: ChatSession, text: strin
   )
   if (!result.ok) {
     if (result.error === 'Invalid payer phone number') {
-      await sendWhatsAppMessage(from, "That number didn't look right — try again (071… / 077… / 078…) or reply *me*.")
+      await sendWhatsAppMessage(from, "That number didn't look right - try again (071… / 077… / 078…) or reply *me*.")
       return
     }
     // Business-state errors terminate the flow cleanly.
@@ -2487,10 +2500,10 @@ async function handleEcoCashText(from: string, session: ChatSession, text: strin
       await sendWhatsAppMessage(
         from,
         [
-          `✅ *${biz.name}* — Personal contact`,
+          `✅ *${biz.name}* - Personal contact`,
           '',
           `💸 USD ${amount.toFixed(2)} · ${PERSONAL_PLAN_CONFIG[plan].label} · EcoCash prompt sent to ${eco}.`,
-          'Enter your PIN and it goes live automatically — I\'ll message you here the moment it does.',
+          'Enter your PIN and it goes live automatically - I\'ll message you here the moment it does.',
           '',
           'Save your edit link:',
           `${SITE_URL}/edit?token=${session.data.pay_token}`,
@@ -2505,7 +2518,7 @@ async function handleEcoCashText(from: string, session: ChatSession, text: strin
           '💸 *EcoCash prompt sent!*',
           '',
           `Check your phone for the $${amount.toFixed(2)} PIN request (${PLAN_CONFIG[plan].label} plan for *${biz.name}*).`,
-          'Enter your PIN and the listing goes live automatically —',
+          'Enter your PIN and the listing goes live automatically -',
           "I'll message you here the moment it does.",
         ].join('\n')
       )
@@ -2515,7 +2528,7 @@ async function handleEcoCashText(from: string, session: ChatSession, text: strin
     await sendWhatsAppMessage(
       from,
       [
-        '📝 *Payment request logged* — nothing charged yet.',
+        '📝 *Payment request logged* - nothing charged yet.',
         '',
         `${session.data.pay_token ? PERSONAL_PLAN_CONFIG[plan].label : PLAN_CONFIG[plan].label} · $${amount.toFixed(2)} for *${biz.name}*.`,
         session.data.pay_token
@@ -2534,7 +2547,7 @@ async function startPaySearch(from: string) {
     from,
     [
       'Which business should the payment go to?',
-      'Send a name, phone, *WA-* ID or @username — or *cancel*.',
+      'Send a name, phone, *WA-* ID or @username - or *cancel*.',
     ].join('\n')
   )
 }
@@ -2580,7 +2593,7 @@ async function handlePaySearchText(from: string, session: ChatSession, text: str
   if (results.length === 0) {
     await sendWhatsAppMessage(
       from,
-      `No business matches "*${text.trim().slice(0, 40)}*".\n\nSend a name, phone, *WA-* ID or @username — or *cancel*.`
+      `No business matches "*${text.trim().slice(0, 40)}*".\n\nSend a name, phone, *WA-* ID or @username - or *cancel*.`
     )
     return
   }
@@ -2607,7 +2620,7 @@ async function handlePaySearchText(from: string, session: ChatSession, text: str
 async function selectPayCandidate(from: string, session: ChatSession | null, n: number) {
   const cand = (session?.data.pay_candidates || [])[n - 1]
   if (!cand) {
-    await sendWhatsAppMessage(from, 'That option expired — send *pay* to restart, or a new search.')
+    await sendWhatsAppMessage(from, 'That option expired - send *pay* to restart, or a new search.')
     return
   }
   await beginPayPlan(from, cand)
@@ -2779,7 +2792,7 @@ async function postBuyerNeed(from: string, session: ChatSession | null) {
     `${d.budget || 'no budget'} · ${(d.city || 'countrywide').toUpperCase()}`,
     `Buyer: +${from}`,
     '',
-    '— channel post (copy below) —',
+    '- channel post (copy below) -',
     channelPostFor(need),
     ...(ch ? ['', ch] : []),
     '',
@@ -2820,7 +2833,7 @@ async function handleRadarCommand(from: string, lower: string): Promise<void> {
     if (!biz) {
       await sendWhatsAppMessage(
         from,
-        'Radar leads are for *verified* suppliers — reply `verify` to get the green tick first.'
+        'Radar leads are for *verified* suppliers - reply `verify` to get the green tick first.'
       )
       return
     }
@@ -2828,7 +2841,7 @@ async function handleRadarCommand(from: string, lower: string): Promise<void> {
     if (!subCity) {
       await sendWhatsAppMessage(
         from,
-        'Your radar is off, so there\'s nothing to claim — reply `radar on` first.'
+        'Your radar is off, so there\'s nothing to claim - reply `radar on` first.'
       )
       return
     }
@@ -2836,20 +2849,20 @@ async function handleRadarCommand(from: string, lower: string): Promise<void> {
     if (!ev) {
       await sendWhatsAppMessage(
         from,
-        'No open leads on the radar right now — I\'ll ping you the moment a matching search lands.'
+        'No open leads on the radar right now - I\'ll ping you the moment a matching search lands.'
       )
       return
     }
     if (!(await claimDemandEvent(ev.id, from))) {
       await sendWhatsAppMessage(
         from,
-        'Someone just grabbed that lead — try `claim` again in a minute.'
+        'Someone just grabbed that lead - try `claim` again in a minute.'
       )
       return
     }
     await sendWhatsAppMessage(
       from,
-      `🎯 Lead taken — "${ev.term}"${ev.city ? ` in ${ev.city}` : ''} (${ev.result_count} result${ev.result_count === 1 ? '' : 's'}).`
+      `🎯 Lead taken - "${ev.term}"${ev.city ? ` in ${ev.city}` : ''} (${ev.result_count} result${ev.result_count === 1 ? '' : 's'}).`
     )
     const buyerDigits = digitsOnly(ev.buyer)
     await sendInteractiveButtons(
@@ -2868,7 +2881,7 @@ async function handleRadarCommand(from: string, lower: string): Promise<void> {
     if (!biz) {
       await sendWhatsAppMessage(
         from,
-        'Radar is for *verified* suppliers — reply `verify` to get the green tick first.'
+        'Radar is for *verified* suppliers - reply `verify` to get the green tick first.'
       )
       return
     }
@@ -2877,8 +2890,8 @@ async function handleRadarCommand(from: string, lower: string): Promise<void> {
     await sendWhatsAppMessage(
       from,
       city === 'all'
-        ? '📡 Radar on — nationwide. I\'ll ping you for matching searches anywhere in Zimbabwe. Reply `radar off` anytime.'
-        : `📡 Radar on — I'll ping you when buyers search for what you sell in ${biz.city}. Reply \`radar off\` anytime.`
+        ? '📡 Radar on - nationwide. I\'ll ping you for matching searches anywhere in Zimbabwe. Reply `radar off` anytime.'
+        : `📡 Radar on - I'll ping you when buyers search for what you sell in ${biz.city}. Reply \`radar off\` anytime.`
     )
     return
   }
@@ -2887,7 +2900,7 @@ async function handleRadarCommand(from: string, lower: string): Promise<void> {
     await recordDemandSub(from, '')
     await sendWhatsAppMessage(
       from,
-      '📡 Radar off — no more pings. Your quotes and listings keep working as usual.'
+      '📡 Radar off - no more pings. Your quotes and listings keep working as usual.'
     )
     return
   }
@@ -2896,8 +2909,8 @@ async function handleRadarCommand(from: string, lower: string): Promise<void> {
   await sendWhatsAppMessage(
     from,
     subCity
-      ? `📡 Your radar is ${subCity === 'all' ? 'on, nationwide' : `on for ${subCity}`} — I ping you when matching buyer searches land. \`claim\` takes the newest lead, \`radar off\` stops pings.`
-      : '📡 *Supplier Radar*\nI ping you when buyers search for what you sell. Verified suppliers only — reply `verify` first, then `radar on` (your city) or `radar all` (nationwide).'
+      ? `📡 Your radar is ${subCity === 'all' ? 'on, nationwide' : `on for ${subCity}`} - I ping you when matching buyer searches land. \`claim\` takes the newest lead, \`radar off\` stops pings.`
+      : '📡 *Supplier Radar*\nI ping you when buyers search for what you sell. Verified suppliers only - reply `verify` first, then `radar on` (your city) or `radar all` (nationwide).'
   )
 }
 
@@ -2914,14 +2927,14 @@ async function handleClaimConsent(
     await unclaimDemandEvent(ev.id)
     await sendWhatsAppMessage(
       from,
-      'That offer is no longer active — nothing was shared.'
+      'That offer is no longer active - nothing was shared.'
     )
     return
   }
 
   if (!yes) {
     await unclaimDemandEvent(ev.id, supplierDigits)
-    await sendWhatsAppMessage(from, 'No problem — nothing was shared.')
+    await sendWhatsAppMessage(from, 'No problem - nothing was shared.')
     await sendWhatsAppMessage(
       supplierDigits,
       `The buyer for "${ev.term}"${ev.city ? ` in ${ev.city}` : ''} declined to share their number. Lead closed.`
@@ -2934,7 +2947,7 @@ async function handleClaimConsent(
     await unclaimDemandEvent(ev.id, supplierDigits)
     await sendWhatsAppMessage(
       from,
-      'That offer expired before you replied — nothing was shared.'
+      'That offer expired before you replied - nothing was shared.'
     )
     await sendWhatsAppMessage(
       supplierDigits,
@@ -2954,7 +2967,7 @@ async function handleClaimConsent(
     await unclaimDemandEvent(evFresh.id, supplierDigits)
     await sendWhatsAppMessage(
       from,
-      'Couldn\'t open the need right now — nothing was shared.'
+      'Couldn\'t open the need right now - nothing was shared.'
     )
     await sendWhatsAppMessage(
       supplierDigits,
@@ -2975,7 +2988,7 @@ async function handleClaimConsent(
   await setDemandEventRq(evFresh.id, need.rq_id)
   await sendWhatsAppMessage(
     supplierDigits,
-    `✅ Buyer approved for "${evFresh.term}" — the need is live as *${need.rq_id}*.\nReply \`quotes ${need.rq_id} <price>\` and they'll see your quote right here.`
+    `✅ Buyer approved for "${evFresh.term}" - the need is live as *${need.rq_id}*.\nReply \`quotes ${need.rq_id} <price>\` and they'll see your quote right here.`
   )
 }
 
@@ -2997,8 +3010,8 @@ async function pickQuoteForBuyer(buyerPhone: string, quoteId: number) {
   await sendWhatsAppMessage(
     buyerPhone,
     [
-      `🎉 Deal noted on *${need.rq_id}* — thread quiet now.`,
-      quote.supplier_name ? `Winner: *${quote.supplier_name}* — their contact card is on its way, one tap to save.` : '',
+      `🎉 Deal noted on *${need.rq_id}* - thread quiet now.`,
+      quote.supplier_name ? `Winner: *${quote.supplier_name}* - their contact card is on its way, one tap to save.` : '',
       other.length > 0 ? `Other quotes for reference: ${other.map(q => q.price).join(', ')}.` : '',
       '',
       'Send a new search or 🛒 *menu* → Post a need anytime.',
@@ -3009,7 +3022,7 @@ async function pickQuoteForBuyer(buyerPhone: string, quoteId: number) {
     quote.supplier_phone,
     [
       `🎉 You won *${need.rq_id}* (${[need.qty, need.item].filter(Boolean).join(' ')}${need.city ? `, ${need.city}` : ''})!`,
-      'The buyer\'s contact card is on its way — one tap to save, then chat directly.',
+      'The buyer\'s contact card is on its way - one tap to save, then chat directly.',
     ].join('\n')
   )
   await sendContactCard(quote.supplier_phone, 'Buyer', need.buyer_phone)
@@ -3133,6 +3146,78 @@ async function handleRqText(from: string, waName: string, text: string): Promise
   )
   return true
 }
+
+// ── Human takeover (chat handoff over WhatsApp) ─────────────────────────
+// A held session relays every inbound message to the admins instead of
+// running the bot. holdChat/releaseChat drive the same `held` flag inside
+// chat_sessions.data that the dashboard hold button writes, so both sides
+// stay in sync with no extra tables.
+
+async function relayHeldMessage(
+  from: string,
+  text: string,
+  action: string,
+  mediaKind: MediaKind | null,
+  location: { lat: number; lng: number } | null
+): Promise<void> {
+  const cur = await getSession(from)
+  if (!cur?.data?.held) return
+  const shown = text
+    || (action ? `[tap: ${action}]` : '')
+    || (mediaKind === 'audio' ? '[voice note]' : '')
+    || (mediaKind === 'image' ? '[photo]' : '')
+    || (location ? `[location ${location.lat.toFixed(5)},${location.lng.toFixed(5)}]` : '')
+    || '[unknown message]'
+  const payer = digitsOnly(from)
+  for (const admin of await adminNumbers()) {
+    if (admin === payer) continue
+    await sendWhatsAppMessage(admin, `🤝 *+${payer}* (${cur.step})\n${shown}`)
+  }
+  // One-time ack: dashboard-only holds stay silent until the user speaks.
+  if (!cur.data.held.notified) {
+    await sendWhatsAppMessage(
+      from,
+      '🤝 Your chat is with our team now — they can see what you sent. Please allow a short moment.'
+    )
+    await saveSession(from, cur.step, { ...cur.data, held: { ...cur.data.held, notified: true } })
+  }
+}
+
+async function holdChat(adminFrom: string, num: string): Promise<void> {
+  if (!num || num.length < 9 || num.startsWith('0')) {
+    await sendWhatsAppMessage(adminFrom, 'Send the full number: *hold 263771234567*.')
+    return
+  }
+  const cur = await getSession(num)
+  await saveSession(num, cur?.step || 'idle', {
+    ...(cur?.data || {}),
+    held: { at: new Date().toISOString(), notified: true },
+  })
+  await sendWhatsAppMessage(
+    num,
+    '🤝 Your chat is with our team now — they can see what you sent. Please allow a short moment.'
+  )
+  await sendWhatsAppMessage(
+    adminFrom,
+    `✋ Chat for +${num} is on hold. Their messages now come to you and other admins. Reply *release ${num}* to hand them back to the bot.`
+  )
+}
+
+async function releaseChat(adminFrom: string, num: string): Promise<void> {
+  if (!num || num.length < 9) {
+    await sendWhatsAppMessage(adminFrom, 'Send the full number: *release 263771234567*.')
+    return
+  }
+  const cur = await getSession(num)
+  if (!cur?.data?.held) {
+    await sendWhatsAppMessage(adminFrom, `ℹ️ +${num} is not on hold.`)
+    return
+  }
+  await saveSession(num, cur.step, { ...cur.data, held: undefined })
+  await sendWhatsAppMessage(num, '🙌 You are back on! Reply *menu* to see everything I can do.')
+  await sendWhatsAppMessage(adminFrom, `✅ +${num} handed back to the bot.`)
+}
+
 async function handleAdminCommand(from: string, text: string): Promise<boolean> {
   const clean = text.trim()
   const lower = clean.toLowerCase()
@@ -3159,7 +3244,7 @@ async function handleAdminCommand(from: string, text: string): Promise<boolean> 
       }
       const dayDigest = await compileDigest(`${dayIso}T00:00:00Z`, new Date(new Date(`${dayIso}T00:00:00Z`).getTime() + 86400000).toISOString())
       await sendWhatsAppMessage(from, dayDigest)
-      await sendWhatsAppMessage(from, '— view only; your cursor is untouched.')
+      await sendWhatsAppMessage(from, '- view only; your cursor is untouched.')
       return true
     }
     const cursor = await getDigestCursor()
@@ -3178,7 +3263,7 @@ async function handleAdminCommand(from: string, text: string): Promise<boolean> 
     await sendWhatsAppMessage(from, digest)
     if (args.length === 0) {
       await bumpDigestCursor(win.toIso)
-      await sendWhatsAppMessage(from, `— cursor moved to ${fmtHarare(win.toIso)} (Harare). Next plain *digest* starts from here.`)
+      await sendWhatsAppMessage(from, `- cursor moved to ${fmtHarare(win.toIso)} (Harare). Next plain *digest* starts from here.`)
     }
     return true
   }
@@ -3209,7 +3294,7 @@ async function handleAdminCommand(from: string, text: string): Promise<boolean> 
         await sendWhatsAppMessage(from, `No needs on ${dayIso.split('-').reverse().join('-')}.`)
         return true
       }
-      const lines = [`📋 *Needs — ${dayIso.split('-').reverse().join('-')}*`, '']
+      const lines = [`📋 *Needs - ${dayIso.split('-').reverse().join('-')}*`, '']
       for (const n of needs) {
         lines.push(
           `${n.rq_id} · ${[n.qty, n.item].filter(Boolean).join(' ')} · ${(n.city || 'countrywide').toUpperCase()}` +
@@ -3238,6 +3323,26 @@ async function handleAdminCommand(from: string, text: string): Promise<boolean> 
     return true
   }
 
+  if (lower === 'hold' || lower.startsWith('hold ')) {
+    if (!(await isBotAdmin(from))) {
+      await sendWhatsAppMessage(from, '🔒 This command is for administrators only.')
+      return true
+    }
+    const num = digitsOnly(clean.slice(5).trim())
+    await holdChat(from, num)
+    return true
+  }
+
+  if (lower === 'release' || lower.startsWith('release ')) {
+    if (!(await isBotAdmin(from))) {
+      await sendWhatsAppMessage(from, '🔒 This command is for administrators only.')
+      return true
+    }
+    const num = digitsOnly(clean.slice(8).trim())
+    await releaseChat(from, num)
+    return true
+  }
+
   if (lower === 'emergency' || lower.startsWith('emergency ')) {
     const admin = await isBotAdmin(from)
     if (!admin) {
@@ -3259,7 +3364,7 @@ async function handleAdminCommand(from: string, text: string): Promise<boolean> 
         for (const c of results) {
           const wa = emergencyWaLink(c.phone)
           const where = [c.suburb, c.city].filter(Boolean).join(', ')
-          await sendWhatsAppMessage(from, `${categoryIcon(c.category)} ${c.category.toUpperCase()} · ${where || '—'} · 📞 ${c.phone}${wa ? ` · ${wa}` : ''}`)
+          await sendWhatsAppMessage(from, `${categoryIcon(c.category)} ${c.category.toUpperCase()} · ${where || '-'} · 📞 ${c.phone}${wa ? ` · ${wa}` : ''}`)
         }
       }
       return true
@@ -3270,7 +3375,7 @@ async function handleAdminCommand(from: string, text: string): Promise<boolean> 
     if (adminLower.startsWith('add ')) {
       const parsed = parseEmergencyAdd(adminClean.slice(4).trim())
       if (!parsed.ok || !parsed.contact) {
-        await sendWhatsAppMessage(from, parsed.error || 'Could not read that — try the *emergency* help.')
+        await sendWhatsAppMessage(from, parsed.error || 'Could not read that - try the *emergency* help.')
         return true
       }
       const c = parsed.contact
@@ -3301,7 +3406,7 @@ async function handleAdminCommand(from: string, text: string): Promise<boolean> 
       const removed = await deleteEmergencyContact(delParts[0] || '', delParts[1])
       await sendWhatsAppMessage(
         from,
-        removed > 0 ? `🗑️ Removed ${removed} contact${removed === 1 ? '' : 's'}.` : 'No match — check the number: *emergency list*.'
+        removed > 0 ? `🗑️ Removed ${removed} contact${removed === 1 ? '' : 's'}.` : 'No match - check the number: *emergency list*.'
       )
       return true
     }
@@ -3319,7 +3424,7 @@ async function handleAdminCommand(from: string, text: string): Promise<boolean> 
           await sendWhatsAppMessage(
             from,
             [
-              `${categoryIcon(c.category)} ${c.category.toUpperCase()} · ${where || '—'}`,
+              `${categoryIcon(c.category)} ${c.category.toUpperCase()} · ${where || '-'}`,
               `📞 ${c.phone}${wa ? ` · ${wa}` : ''}` + (c.name ? `\n${c.name}` : ''),
             ].join('\n')
           )
@@ -3338,11 +3443,11 @@ async function handleAdminCommand(from: string, text: string): Promise<boolean> 
     // fallback help
     await sendWhatsAppMessage(from, [
       'Emergency contact tools:',
-      '*emergency add <phone> [category] <suburb> <city>* — save one (e.g. *add 263771234567 ambulance Waterford Bulawayo*)',
-      '*emergency del <phone> [city-word]* — remove one',
-      '*emergency list* — everything saved',
-      '*emergency near <city>* — what buyers would get there',
-      '*emergency clear* — wipe the whole list',
+      '*emergency add <phone> [category] <suburb> <city>* - save one (e.g. *add 263771234567 ambulance Waterford Bulawayo*)',
+      '*emergency del <phone> [city-word]* - remove one',
+      '*emergency list* - everything saved',
+      '*emergency near <city>* - what buyers would get there',
+      '*emergency clear* - wipe the whole list',
       '',
       `Categories: ${[...VALID_CATEGORIES].join(' | ')} (default: police).`,
     ].join('\n'))
@@ -3356,7 +3461,7 @@ async function handleAdminCommand(from: string, text: string): Promise<boolean> 
       return true
     }
     const ok = await closeNeedByRqId(rqId, 'admin')
-    await sendWhatsAppMessage(from, ok ? `✅ ${rqId} closed — no more quotes relay.` : `${rqId} was not open (might already be closed).`)
+    await sendWhatsAppMessage(from, ok ? `✅ ${rqId} closed - no more quotes relay.` : `${rqId} was not open (might already be closed).`)
     return true
   }
 
@@ -3416,7 +3521,7 @@ async function handleAdminCommand(from: string, text: string): Promise<boolean> 
     }
 
     const now = Date.now()
-    const lines = [`📋 *Subscriptions${arg ? ` — ${arg}` : ''}* (${subs.length})`, '']
+    const lines = [`📋 *Subscriptions${arg ? ` - ${arg}` : ''}* (${subs.length})`, '']
     for (let i = 0; i < subs.length; i++) {
       const s = subs[i]
       const biz = s.businesses as any
@@ -3622,7 +3727,7 @@ async function handleAdminCommand(from: string, text: string): Promise<boolean> 
       return true
     }
     await reopenNeed(need.id)
-    await sendWhatsAppMessage(from, `🔄 ${need.rq_id} reopened — quotes relay again.`)
+    await sendWhatsAppMessage(from, `🔄 ${need.rq_id} reopened - quotes relay again.`)
     return true
   }
 
@@ -3704,7 +3809,7 @@ async function handleAdminCommand(from: string, text: string): Promise<boolean> 
     await saveSession(from, 'admin_pending', { pendingBiz: bus.map(b => b.id) } as ChatSessionData)
     const lines = ['🕵️ *Unverified businesses*', '']
     bus.forEach((b, i) => {
-      lines.push(`${i + 1}. ${b.name} · ${(b.city || '—').toUpperCase()} · ${fmtHarare(b.created_at, true)}${b.phone ? ` · +${digitsOnly(b.phone)}` : ''}`)
+      lines.push(`${i + 1}. ${b.name} · ${(b.city || '-').toUpperCase()} · ${fmtHarare(b.created_at, true)}${b.phone ? ` · +${digitsOnly(b.phone)}` : ''}`)
     })
     lines.push(
       '',
@@ -3725,7 +3830,7 @@ async function handleAdminCommand(from: string, text: string): Promise<boolean> 
     if (!arg) {
       await sendWhatsAppMessage(
         from,
-        `Use *${op} <number>* after *pending*, or match by name: *${op} <business name> [days]* — e.g. *${op} Diamond tradings 30*.`
+        `Use *${op} <number>* after *pending*, or match by name: *${op} <business name> [days]* - e.g. *${op} Diamond tradings 30*.`
       )
       return true
     }
@@ -3782,7 +3887,7 @@ async function handleAdminCommand(from: string, text: string): Promise<boolean> 
           pendingOp: op,
           ...(days ? { pendingDays: days } : {}),
         } as ChatSessionData)
-        const lines = [`🤔 Closest matches to *${rest}* — reply *${op} 1* to pick:`, '']
+        const lines = [`🤔 Closest matches to *${rest}* - reply *${op} 1* to pick:`, '']
         matches.forEach((b, i) => {
           lines.push(
             `${i + 1}. *${b.name}*${b.city ? ` · ${b.city}` : ''} · ${b.verified ? 'verified' : 'unverified'}`
@@ -3795,7 +3900,7 @@ async function handleAdminCommand(from: string, text: string): Promise<boolean> 
     }
 
     if (!biz) {
-      await sendWhatsAppMessage(from, 'That business was not found — run *pending* again.')
+      await sendWhatsAppMessage(from, 'That business was not found - run *pending* again.')
       return true
     }
 
@@ -3815,7 +3920,7 @@ async function handleAdminCommand(from: string, text: string): Promise<boolean> 
         const until = grant.expiresAt ? grant.expiresAt.slice(0, 10) : ''
         await sendWhatsAppMessage(
           from,
-          `✅ *${biz.name}* approved — live in search for ${days || 30} days${until ? ` (until ${until})` : ''}.`
+          `✅ *${biz.name}* approved - live in search for ${days || 30} days${until ? ` (until ${until})` : ''}.`
         )
         if (biz.phone && digitsOnly(biz.phone) !== digitsOnly(from)) {
           await notifyBusinessLive(biz)
@@ -3838,12 +3943,12 @@ async function handleAdminCommand(from: string, text: string): Promise<boolean> 
       await sendWhatsAppMessage(
         from,
         [
-          '📣 *Broadcast* — reaches contacts active in the last 24h (opted-out skipped).',
-          '`cast <message>` — everyone',
+          '📣 *Broadcast* - reaches contacts active in the last 24h (opted-out skipped).',
+          '`cast <message>` - everyone',
           '`cast owners <message>` · `cast buyers <message>`',
-          '`cast owners harare <message>` — city or category filter',
-          '`cast owners today 15:30 <message>` — schedule (Harare time)',
-          '`casts` — recent casts · `cast cancel <id>`',
+          '`cast owners harare <message>` - city or category filter',
+          '`cast owners today 15:30 <message>` - schedule (Harare time)',
+          '`casts` - recent casts · `cast cancel <id>`',
         ].join('\n')
       )
       return true
@@ -3856,7 +3961,7 @@ async function handleAdminCommand(from: string, text: string): Promise<boolean> 
         from,
         okC
           ? `✖️ Cast #${cancelM[1]} cancelled.`
-          : `Cast #${cancelM[1]} could not be cancelled — unknown id or already sent.`
+          : `Cast #${cancelM[1]} could not be cancelled - unknown id or already sent.`
       )
       return true
     }
@@ -3918,7 +4023,7 @@ async function handleAction(from: string, session: ChatSession | null, action: s
       return
     }
     if (!spec || !spec.body) {
-      await sendWhatsAppMessage(from, 'Nothing to send — start with *cast your message*.')
+      await sendWhatsAppMessage(from, 'Nothing to send - start with *cast your message*.')
       return
     }
     const audience = await resolveCastAudience(spec)
@@ -3930,13 +4035,13 @@ async function handleAction(from: string, session: ChatSession | null, action: s
     if (action === 'cast_sched') {
       if (!spec.scheduledFor) {
         await clearSession(from)
-        await sendWhatsAppMessage(from, 'No time was set — add one: *cast owners today 15:30 <message>*.')
+        await sendWhatsAppMessage(from, 'No time was set - add one: *cast owners today 15:30 <message>*.')
         return
       }
       const castId = await enqueueCast(spec, from, spec.scheduledFor, audience)
       await clearSession(from)
       if (!castId) {
-        await sendWhatsAppMessage(from, 'Could not queue the cast — try again shortly.')
+        await sendWhatsAppMessage(from, 'Could not queue the cast - try again shortly.')
         return
       }
       await sendWhatsAppMessage(
@@ -3953,7 +4058,7 @@ async function handleAction(from: string, session: ChatSession | null, action: s
     const castId = await enqueueCast(spec, from, null, audience)
     if (!castId) {
       await clearSession(from)
-      await sendWhatsAppMessage(from, 'Could not queue the cast — try again shortly.')
+      await sendWhatsAppMessage(from, 'Could not queue the cast - try again shortly.')
       return
     }
     const chunk = await sendCastChunk(castId, SYNC_MAX_SENDS)
@@ -3965,7 +4070,7 @@ async function handleAction(from: string, session: ChatSession | null, action: s
     await sendWhatsAppMessage(
       from,
       [
-        `📣 Cast #${castId} started — first ${SYNC_MAX_SENDS} recipients sent.`,
+        `📣 Cast #${castId} started - first ${SYNC_MAX_SENDS} recipients sent.`,
         `⏳ The remaining ${audience.length - SYNC_MAX_SENDS} continue automatically (100 per hour).`,
         'Final counts arrive when the cast completes.',
       ].join('\n')
@@ -3984,7 +4089,7 @@ async function handleAction(from: string, session: ChatSession | null, action: s
     await saveSession(from, 'order', { ...session?.data, pendingOrder: undefined })
     await sendWhatsAppMessage(
       from,
-      'Say it again and I will type along — e.g. *order 2 bread, 1 cake*, or *order 1 bread 2 scones*.'
+      'Say it again and I will type along - e.g. *order 2 bread, 1 cake*, or *order 1 bread 2 scones*.'
     )
     return
   }
@@ -4001,7 +4106,7 @@ async function handleAction(from: string, session: ChatSession | null, action: s
   if (itemBiz) {
     const img = session?.data.pendingItemImage || ''
     if (!img) {
-      await sendWhatsAppMessage(from, 'That pick expired — send the product photo again.')
+      await sendWhatsAppMessage(from, 'That pick expired - send the product photo again.')
       return
     }
     const { data: row } = await getSupabase()
@@ -4040,13 +4145,13 @@ async function handleAction(from: string, session: ChatSession | null, action: s
         await closeNeedByRqId(deal[2], 'buyer')
         await sendWhatsAppMessage(
           from,
-          `🎉 Sorted — congrats on the deal. That's exactly what this space is for. Send a new search anytime.`
+          `🎉 Sorted - congrats on the deal. That's exactly what this space is for. Send a new search anytime.`
         )
       } else {
         await reopenNeed(need.id)
         await sendWhatsAppMessage(
           from,
-          `🔄 ${deal[2]} reopened — suppliers see it again and can quote. Tap ✋ on any quote card if it gets noisy.`
+          `🔄 ${deal[2]} reopened - suppliers see it again and can quote. Tap ✋ on any quote card if it gets noisy.`
         )
       }
     }
@@ -4167,7 +4272,7 @@ async function handleAction(from: string, session: ChatSession | null, action: s
         } else {
           await sendWhatsAppMessage(
             from,
-            `That's all ${cards.length} match${cards.length === 1 ? '' : 'es'} — reply a number or tap a business.`
+            `That's all ${cards.length} match${cards.length === 1 ? '' : 'es'} - reply a number or tap a business.`
           )
         }
         return
@@ -4180,7 +4285,7 @@ async function handleAction(from: string, session: ChatSession | null, action: s
         const cards = session.data.results || []
         await sendWhatsAppMessage(
           from,
-          `That's all ${cards.length} match${cards.length === 1 ? '' : 'es'} for *${session.data.lastTerm || 'your search'}* — reply a number or send a new search.`
+          `That's all ${cards.length} match${cards.length === 1 ? '' : 'es'} for *${session.data.lastTerm || 'your search'}* - reply a number or send a new search.`
         )
         return
       }
@@ -4218,7 +4323,7 @@ async function handleAction(from: string, session: ChatSession | null, action: s
       if (keptPaused) {
         await sendWhatsAppMessage(
           from,
-          "No problem — plans have changed 👍\nI've set what you were doing aside; reply *resume* to pick it up again."
+          "No problem - plans have changed 👍\nI've set what you were doing aside; reply *resume* to pick it up again."
         )
       }
       await clearSession(from)
@@ -4239,7 +4344,7 @@ async function handleAction(from: string, session: ChatSession | null, action: s
       if (keptPaused) {
         await sendWhatsAppMessage(
           from,
-          "No problem — plans have changed 👍\nI've set what you were doing aside; reply *resume* to pick it up again."
+          "No problem - plans have changed 👍\nI've set what you were doing aside; reply *resume* to pick it up again."
         )
       }
       if (ask.kind === 'pay') await startPayChoice(from)
@@ -4256,7 +4361,7 @@ async function handleAction(from: string, session: ChatSession | null, action: s
       await sendWhatsAppMessage(
         from,
         [
-          'Send the corrected line — what + how many (+ town, budget).',
+          'Send the corrected line - what + how many (+ town, budget).',
           'e.g. *50 bags cement harare $40-60*',
         ].join('\n')
       )
@@ -4297,7 +4402,7 @@ async function handleAction(from: string, session: ChatSession | null, action: s
     }
     case 'resume_paused': {
       if (!(await resumePaused(from, session || (await getSession(from))))) {
-        await sendWhatsAppMessage(from, "That draft has expired — send *register* to start again.")
+        await sendWhatsAppMessage(from, "That draft has expired - send *register* to start again.")
       }
       return
     }
@@ -4473,7 +4578,7 @@ async function sendResultsListPage(
   if (photoItem) {
     await sendInteractiveButtons(
       from,
-      `Want a peek at *${photoItem.name}*? I can show its photo right here — no need to open the shop.`,
+      `Want a peek at *${photoItem.name}*? I can show its photo right here - no need to open the shop.`,
       [{ id: `see_photo_${photoItem.id}`, title: '📸 See product photo' }],
       replyTo
     )
@@ -4484,7 +4589,7 @@ async function sendResultsListPage(
   if (page === 0 && relatedTerms?.length) {
     await sendInteractiveButtons(
       from,
-      `Also showing shops related to *${termDisplay}* in the list above — or tap to search:`,
+      `Also showing shops related to *${termDisplay}* in the list above - or tap to search:`,
       relatedTerms.slice(0, 3).map(t => ({
         id: `relsearch_${encodeURIComponent(t)}`,
         title: t.charAt(0).toUpperCase() + t.slice(1),
@@ -4895,9 +5000,9 @@ async function typedOrderFromText(from: string, session: ChatSession | null, tai
     await sendWhatsAppMessage(
       from,
       [
-        '🧺 Tell me what to order — quantities first, then names.',
+        '🧺 Tell me what to order - quantities first, then names.',
         'e.g. *order 2 bread, 1 cake* or *order 1 bread 2 scones*',
-        ctx ? `Your words go straight to *${ctx}*'s shelf — other shops supply anything they don't stock.` : 'I find the shops that stock those items and package the order per shop.',
+        ctx ? `Your words go straight to *${ctx}*'s shelf - other shops supply anything they don't stock.` : 'I find the shops that stock those items and package the order per shop.',
         '',
         'Or reply a number to keep browsing. Send *menu* anytime.',
       ].join('\n')
@@ -4971,7 +5076,7 @@ async function renderPendingVerify(
         '🔍 Nothing on any shelf matches:',
         ...missed,
         '',
-        'Try another name — or *menu* to browse shops.',
+        'Try another name - or *menu* to browse shops.',
       ].join('\n')
     )
     return
@@ -4991,7 +5096,7 @@ async function renderPendingVerify(
       ? [
           '',
           `⚠️ Waiting for corrected items: ${[...unmatched.map(u => u.term), ...junk].join(', ')}`,
-          'These are skipped for now — type the order again to fix them BEFORE sending.',
+          'These are skipped for now - type the order again to fix them BEFORE sending.',
         ].join('\n')
       : ''
   await sendWhatsAppMessage(from, `${renderOrderVerify(pendingOrder.groups)}\n${note}`)
@@ -5007,7 +5112,7 @@ async function renderPendingVerify(
 async function commitPendingOrder(from: string, session: ChatSession | null) {
   const pending = session?.data.pendingOrder
   if (!pending || !pending.groups.length) {
-    await sendWhatsAppMessage(from, 'Nothing queued yet — type *order 2 bread* to start one.')
+    await sendWhatsAppMessage(from, 'Nothing queued yet - type *order 2 bread* to start one.')
     return
   }
   const groupId = `G${Date.now().toString(36)}${crypto.randomBytes(3).toString('hex')}`
@@ -5024,7 +5129,7 @@ async function commitPendingOrder(from: string, session: ChatSession | null) {
     if (row) rows.push(row)
   }
   if (!rows.length) {
-    await sendWhatsAppMessage(from, '⚠️ Could not file the order — try again in a minute.')
+    await sendWhatsAppMessage(from, '⚠️ Could not file the order - try again in a minute.')
     return
   }
   for (const row of rows) {
@@ -5051,13 +5156,13 @@ async function commitPendingOrder(from: string, session: ChatSession | null) {
     const g = pending.groups.find(gr => gr.businessName === r.biz_name)
     await sendCtaUrl(
       from,
-      `Send your order to *${r.biz_name}* — one tap opens their chat with it typed in.`,
+      `Send your order to *${r.biz_name}* - one tap opens their chat with it typed in.`,
       '📤 Send now ▸',
       `${SITE_URL}/go/o/${r.token}`
     )
     if (g && !g.supplierDigits) {
       // Voice-only shop: no wa.me — remind to call.
-      await sendWhatsAppMessage(from, `📞 *${r.biz_name}* is voice-only too — the link dials them with your order ready to read.`)
+      await sendWhatsAppMessage(from, `📞 *${r.biz_name}* is voice-only too - the link dials them with your order ready to read.`)
     }
   }
 }
@@ -5078,13 +5183,13 @@ async function pushOrderToSupplier(row: SupplyOrderRow, buyerPhone: string): Pro
     '🧾 *New order on WA Directory*',
     '',
     ...((row.lines || []) as { name: string; qty: number; price: number | null }[]).map(
-      l => `• ${l.qty} × ${l.name}${l.price != null ? ` — $${l.price}` : ''}`
+      l => `• ${l.qty} × ${l.name}${l.price != null ? ` - $${l.price}` : ''}`
     ),
     '',
     `Buyer: +${digitsOnly(buyerPhone)}`,
     `Checkout: ${shortUrl}`,
     '',
-    'Tap ✅ when you can supply — the buyer is notified instantly.',
+    'Tap ✅ when you can supply - the buyer is notified instantly.',
   ].join('\n')
 
   if (!digits) {
@@ -5168,7 +5273,7 @@ async function handleClaimTap(from: string, session: ChatSession | null, orderId
   }
   const claimed = await claimSupplyOrder(orderId)
   if (!claimed) {
-    await sendWhatsAppMessage(from, 'Already confirmed — the buyer knows.')
+    await sendWhatsAppMessage(from, 'Already confirmed - the buyer knows.')
     return
   }
   const buyer = digitsOnly(row.buyer_phone)
@@ -5180,14 +5285,14 @@ async function handleClaimTap(from: string, session: ChatSession | null, orderId
   if (digits) {
     await sendCtaUrl(
       buyer,
-      `*${row.biz_name}* confirmed your order — say hi and lock in pickup/delivery 🛒`,
+      `*${row.biz_name}* confirmed your order - say hi and lock in pickup/delivery 🛒`,
       '💬 Chat shop ▸',
       `https://wa.me/${digits}?text=${encodeURIComponent(
-        `Hello! I placed order wa.directory/go/o/${row.token} — my number was shared.`
+        `Hello! I placed order wa.directory/go/o/${row.token} - my number was shared.`
       )}`
     )
   }
-  await sendWhatsAppMessage(from, `✅ Noted — your buyer has been pinged with this chat.`)
+  await sendWhatsAppMessage(from, `✅ Noted - your buyer has been pinged with this chat.`)
   void session
 }
 
@@ -5201,7 +5306,7 @@ async function sendSupplierOrders(from: string, session: ChatSession | null) {
     .or(`phone.ilike.${digits},phone.ilike.+${digits},phone.ilike.%${digits}`)
     .limit(3)
   if (!bizRows || !bizRows.length) {
-    await sendWhatsAppMessage(from, 'No shop synced to this WhatsApp number yet. List yours first — *menu*.')
+    await sendWhatsAppMessage(from, 'No shop synced to this WhatsApp number yet. List yours first - *menu*.')
     return
   }
   const allRows: SupplyOrderRow[] = []
@@ -5224,7 +5329,7 @@ async function sendSupplierOrders(from: string, session: ChatSession | null) {
   await sendWhatsAppMessage(from, lines.join('\n'))
   await sendInteractiveButtons(
     from,
-    'Tap to confirm an order — the buyer is notified instantly.',
+    'Tap to confirm an order - the buyer is notified instantly.',
     allRows.slice(0, 3).map(r => ({ id: `oclaim_${r.id}`, title: `✅ ${r.token}` }))
   )
 }
@@ -5234,7 +5339,7 @@ async function sendMyOrders(from: string, session: ChatSession | null) {
   void session
   const rows = await listOrdersForBuyer(digitsOnly(from), 5)
   if (!rows.length) {
-    await sendWhatsAppMessage(from, '🧾 No orders yet — type *order 2 bread* to see how it works.')
+    await sendWhatsAppMessage(from, '🧾 No orders yet - type *order 2 bread* to see how it works.')
     return
   }
   await sendWhatsAppMessage(
@@ -5332,6 +5437,23 @@ async function sendResultDetail(
       { id: `browse_items_detail_${b.id}`, title: '🧺 Browse all items' },
       { id: `photo_pick_${b.id}`, title: '📸 See a photo' },
     ])
+  }
+
+  // 🧭 Directions — coords give a one-tap Google Maps route, otherwise a
+  // place search from name + area + city. Skipped when there is not enough
+  // to point at anything useful.
+  const hasCoords = b.lat != null && b.lng != null
+  const placeBits = [b.name, b.area, b.city, 'Zimbabwe'].filter(Boolean)
+  if (hasCoords || (b.name && (b.area || b.city))) {
+    const directionsUrl = hasCoords
+      ? `https://www.google.com/maps/dir/?api=1&destination=${b.lat},${b.lng}`
+      : `https://www.google.com/maps/search/?api=1&query=${encodeURIComponent(placeBits.join(', '))}`
+    await sendCtaUrl(
+      from,
+      `Not sure where *${b.name}* is? One tap opens Google Maps with directions.`,
+      '🧭 Get directions ▸',
+      directionsUrl
+    )
   }
 
   // Selection analytics — 'bot_select' requires migration 023 to be applied;
@@ -5513,9 +5635,9 @@ async function handleViewCart(from: string, session: ChatSession | null) {
 
   let body = `🛒 *Your Cart* (${summary.totalItems} items)\n\n`
   for (const group of summary.groups) {
-    body += `🏪 *${group.businessName}* — ${monoUSD(group.subtotal).replace(/`/g, '')}\n`
+    body += `🏪 *${group.businessName}* - ${monoUSD(group.subtotal).replace(/`/g, '')}\n`
     for (const item of group.items) {
-      body += `  • ${item.itemName} ×${item.qty} — ${monoUSD(item.price * item.qty).replace(/`/g, '')}\n`
+      body += `  • ${item.itemName} ×${item.qty} - ${monoUSD(item.price * item.qty).replace(/`/g, '')}\n`
     }
     body += '\n'
   }
@@ -5649,13 +5771,13 @@ async function publishBusiness(from: string, session: ChatSession, msgId?: strin
       'Once an admin approves it you will get a confirmation here.',
       '',
       result.pendingPayment
-        ? '💵 To go live: pay USD 1 — I will ask for your EcoCash number next (or pay at ' + SITE_URL + '/pay)'
+        ? '💵 To go live: pay USD 1 - I will ask for your EcoCash number next (or pay at ' + SITE_URL + '/pay)'
         : '⭐ Public-service listing: our team verifies it fast.',
       '',
       '📸 *After go-live:* send a product photo with a caption that includes the product name and price (e.g. *bread $2*), and you can add extra details like *\"i make home deliveries and customize cakes to your liking\"*.',
       'The bot will format it beautifully: it will quote your description, **bold the name**, and `inline-code` the price.',
       '',
-      '📸 *Photo tips:* While optional, we strongly recommend uploading original photos of your actual products — this builds customer trust. Please avoid internet-sourced or AI-generated images. If we detect non-original images, they may be removed.',
+      '📸 *Photo tips:* While optional, we strongly recommend uploading original photos of your actual products - this builds customer trust. Please avoid internet-sourced or AI-generated images. If we detect non-original images, they may be removed.',
       '',
       `✏️ Save this link to edit your listing later:`,
       `${SITE_URL}/edit?token=${token}`,
@@ -5743,7 +5865,7 @@ async function continueRegistration(from: string, session: ChatSession, text: st
 
     case 'category': {
       const approved = await getApprovedCategories()
-      const category = matchCategoryAgainst(t, approved)
+      const category = await matchCategoryLearned(t, approved)
       if (category === 'Other') {
         const list = approved
           .filter(c => c.name !== 'Other')
@@ -5780,7 +5902,7 @@ async function continueRegistration(from: string, session: ChatSession, text: st
         await sendConfirmation(from, merged)
         break
       }
-      const city = findCity(t)
+      const city = await findCityLearned(t)
       if (!city) {
         const cities = zimbabweCities.slice(0, 8).map(c => c.name).join(', ')
         await sendWhatsAppMessage(from, `I couldn't find that town. Pick one:\n\n${cities}...\n\nOr type *whole country*`)
@@ -5810,7 +5932,7 @@ async function continueRegistration(from: string, session: ChatSession, text: st
         await sendConfirmation(from, merged)
         break
       }
-      const area = findArea(city, t)
+      const area = await findAreaLearned(city, t)
       if (!area) {
         await sendWhatsAppMessage(from, `I couldn't match that area in *${city}*. Type one of the areas listed, or *skip*.`)
         break
@@ -5978,6 +6100,16 @@ export async function POST(request: Request) {
             continue
           }
           // Admins fall through: their phone works as a normal user too.
+        }
+
+        // ── Human takeover gate ─────────────────────────────────────────
+        // Held sessions relay inbound messages to the admins instead of
+        // driving bot flows. stop-opt-out was handled before this point,
+        // so an admin hold never blocks opt-out. contactSession (not
+        // session) is used because idle-step rows are nulled further down.
+        if (contactSession?.data?.held) {
+          await relayHeldMessage(from, text, action, mediaKind, location)
+          continue
         }
 
         if (action) {
@@ -6235,7 +6367,7 @@ export async function POST(request: Request) {
           if (lower === 'no' || lower === 'edit' || lower === 'retype') {
             await sendWhatsAppMessage(
               from,
-              'Say it again and I will type along — e.g. *order 2 bread, 1 cake*.'
+              'Say it again and I will type along - e.g. *order 2 bread, 1 cake*.'
             )
             await sendInteractiveButtons(from, '', [{ id: 'osend', title: '✅ Send as-is' }])
             continue
@@ -6278,7 +6410,7 @@ export async function POST(request: Request) {
             } else {
               await sendWhatsAppMessage(
                 from,
-                `That's all ${results.length} match${results.length === 1 ? '' : 'es'} — reply a number or tap a business.`
+                `That's all ${results.length} match${results.length === 1 ? '' : 'es'} - reply a number or tap a business.`
               )
             }
             continue
@@ -6333,11 +6465,11 @@ export async function POST(request: Request) {
               `📱 +${c.phone.startsWith('263') ? c.phone : '263' + c.phone.replace(/^0/, '')}`,
               ...socialLines,
               '',
-              'Personal contact pricing — pick a package:',
+              'Personal contact pricing - pick a package:',
               '• USD 1 · 1 month',
               '• USD 5 · 6 months',
               '• USD 10 · 12 months',
-              'Paid via EcoCash — you enter the PIN after you choose.',
+              'Paid via EcoCash - you enter the PIN after you choose.',
             ].join('\n'),
             [
               { id: 'reg_contact_pay_monthly', title: 'Pay $1 · 1 month' },

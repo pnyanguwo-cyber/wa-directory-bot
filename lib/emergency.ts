@@ -1,4 +1,4 @@
-﻿// Emergency-contacts manager for the WhatsApp directory bot.
+// Emergency-contacts manager for the WhatsApp directory bot.
 // Stores a JSON array in bot_settings under the key `emergency_contacts`.
 // Each entry: { phone, category, suburb, city, name? }
 // category ∈ police | ambulance | fire | vet | tow | other
@@ -136,7 +136,7 @@ export function parseEmergencyAdd(input: string): ParseEmergencyAddResult {
   }
   const phone = parts[0].replace(/\D/g, '')
   if (phone.length < 6) {
-    return { ok: false, error: 'That phone is too short — international digits, e.g. *263771234567* or *0771234567*.' }
+    return { ok: false, error: 'That phone is too short - international digits, e.g. *263771234567* or *0771234567*.' }
   }
   let category = 'police'
   let rest = parts.slice(1)

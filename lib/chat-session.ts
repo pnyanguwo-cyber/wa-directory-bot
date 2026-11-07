@@ -92,6 +92,13 @@ export interface ChatSessionData {
   // opened a different one ("shopping → actually, register my business").
   // Set aside rather than deleted, so *resume* can restore it.
   paused?: PausedDraft
+  // ── Human takeover (handoff) ─────────────────────────────────────────
+  // Set when an admin holds this user for a live takeover: their messages
+  // are relayed to admin WhatsApp instead of driving flows. `notified`
+  // flips once the user has been told a human is in the loop (bot-command
+  // holds notify immediately; dashboard-only holds defer to the first
+  // inbound message). Cleared explicitly (`held: undefined`) on release.
+  held?: { at: string; notified?: boolean }
   // ── Goal-word ask (two-way: search vs menu action) ───────────────────
   // A menu word ("pay", "register", "order") that ALSO matched businesses:
   // the prompt waiting on the 🔍 / flow picker tap.
@@ -169,16 +176,24 @@ export async function saveSession(phone: string, step: string, data: ChatSession
     let out = data
     // A flow shelved by an intent pivot survives every later save unless the
     // caller explicitly drops it (`paused: undefined`), so moving to another
-    // flow never silently throws the half-finished one away.
-    if (!('paused' in data)) {
+    // flow never silently throws the half-finished one away. An admin hold
+    // (`held`) is likewise sticky until an explicit `held: undefined` —
+    // normal flow saves must never silently end a takeover.
+    if (!('paused' in data) || !('held' in data)) {
       const { data: row } = await supabase
         .from('chat_sessions')
         .select('data')
         .eq('phone', phone)
         .maybeSingle()
-      const paused = row?.data?.paused as PausedDraft | undefined
-      if (paused?.step && Date.now() - Date.parse(paused.at || '') < PAUSE_TTL_MS) {
-        out = { ...data, paused }
+      if (!('paused' in data)) {
+        const paused = row?.data?.paused as PausedDraft | undefined
+        if (paused?.step && Date.now() - Date.parse(paused.at || '') < PAUSE_TTL_MS) {
+          out = { ...out, paused }
+        }
+      }
+      if (!('held' in data)) {
+        const held = row?.data?.held as ChatSessionData['held'] | undefined
+        if (held) out = { ...out, held }
       }
     }
     await supabase

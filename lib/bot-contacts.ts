@@ -1,4 +1,4 @@
-﻿import { getSupabase } from '@wa-directory/shared'
+import { getSupabase } from '@wa-directory/shared'
 import { sendInteractiveButtons } from '@wa-directory/shared'
 
 // One row per WhatsApp number that talks to the bot (customer base).
@@ -105,6 +105,22 @@ export async function sweepIdleNudges(
       .order('last_seen', { ascending: false })
       .limit(8)
 
+    // Users under a human takeover (chat_sessions.data.held) get no
+    // automated nudges — an agent is speaking for the business.
+    let held: Set<string> | null = null
+    const duePhones = (due || []).map(c => c.phone)
+    if (duePhones.length > 0) {
+      const { data: heldRows } = await getSupabase()
+        .from('chat_sessions')
+        .select('phone, data')
+        .in('phone', duePhones)
+      held = new Set(
+        (heldRows || [])
+          .filter(r => (r.data as { held?: unknown } | null)?.held)
+          .map(r => r.phone)
+      )
+    }
+
     const ACTIVE_NUDGE_STEPS = new Set([
       'search_term',
       'search_loc',
@@ -119,6 +135,8 @@ export async function sweepIdleNudges(
       if (skip.has(c.phone)) continue
       // Only nudge users who abandoned an active search or order flow
       if (!c.last_step || !ACTIVE_NUDGE_STEPS.has(c.last_step)) continue
+      // Under human takeover: stay silent.
+      if (held && held.has(c.phone)) continue
       await getSupabase()
         .from('bot_contacts')
         .update({ nudge_sent_at: new Date().toISOString() })
@@ -137,7 +155,7 @@ const APP_LINK = process.env.SITE_URL || 'https://wadirectory.co.zw'
 
 export function idleNudgeBody(): string {
   return [
-    'Hey! You were looking for something — just reply with what you need and I\'ll find it.',
+    'Hey! You were looking for something - just reply with what you need and I\'ll find it.',
     'If you\'re no longer searching, press **End search**.',
   ].join('\n')
 }

@@ -1,4 +1,4 @@
-﻿import { zimbabweCities } from '@wa-directory/shared'
+import { zimbabweCities } from '@wa-directory/shared'
 import { categories as staticCategories } from '@wa-directory/shared'
 import { dedupeCategories } from '@wa-directory/shared'
 
@@ -109,7 +109,7 @@ function normalizeCatalogLink(link: string): string {
   return /^https?:\/\//i.test(link) ? link : `https://${link}`
 }
 const USERNAME_RE = /@([a-zA-Z0-9_]{3,})/
-const PRICE_RE = /\$?\s?(\d+(?:[.,]\d+)?)\s?(?:-|–|—|to)\s?\$?\s?(\d+(?:[.,]\d+)?)/i
+const PRICE_RE = /\$?\s?(\d+(?:[.,]\d+)?)\s?(?:-|–|-|to)\s?\$?\s?(\d+(?:[.,]\d+)?)/i
 const ME_RE = /^(me|mine|my number|this number|use mine)\b/i
 const VOICE_RE = /\b(voice|hotline|landline|call only)\b/i
 
@@ -487,51 +487,51 @@ function fieldLines(state: ListingFormState, senderPhone: string): string[] {
   }
 
   const phoneOk = !!state.phone && state.phone.replace(/\D/g, '').length >= 9
-  push(!!state.name, 'Name', state.name || '', 'missing — send the business name')
+  push(!!state.name, 'Name', state.name || '', 'missing - send the business name')
   push(
     !!state.categories?.length,
     'Category',
     state.categories?.join(', ') || '',
-    "missing — e.g. Salon, Bakery, Building Materials…"
+    "missing - e.g. Salon, Bakery, Building Materials…"
   )
   push(
     !!(state.city || state.whole_country),
     'City',
     state.whole_country ? 'Whole country' : state.city || '',
-    'recommended — e.g. Harare… (or *whole country*)'
+    'recommended - e.g. Harare… (or *whole country*)'
   )
   push(
     phoneOk,
     'Phone',
     phoneOk ? (state.phone_type === 'voice' ? `${state.phone} (voice)` : state.phone!) : '',
-    `missing — send a number, or reply *me*${senderPhone ? ` to use ${senderPhone}` : ''}`
+    `missing - send a number, or reply *me*${senderPhone ? ` to use ${senderPhone}` : ''}`
   )
-  push(!!state.area, 'Area', state.area || '', 'optional — e.g. Avondale…')
+  push(!!state.area, 'Area', state.area || '', 'optional - e.g. Avondale…')
   push(
     !!state.description,
     'Description',
     state.description || '',
-    'optional — what you offer, in one line'
+    'optional - what you offer, in one line'
   )
   push(
     !!state.price_range,
     'Prices',
     state.price_range || '',
-    'optional — cheapest item to most expensive, e.g. $5 - $40'
+    'optional - cheapest item to most expensive, e.g. $5 - $40'
   )
   push(
     !!state.website,
     'Website',
     state.website || '',
-    'optional but important — if you have one, send it (e.g. www.myshop.co.zw)'
+    'optional but important - if you have one, send it (e.g. www.myshop.co.zw)'
   )
   push(
     !!state.catalog,
     'Catalog',
     state.catalog || '',
-    'optional — WhatsApp catalog link (wa.me/c/…)'
+    'optional - WhatsApp catalog link (wa.me/c/…)'
   )
-  push(!!state.address, 'Address', state.address || '', 'optional — street / stand number')
+  push(!!state.address, 'Address', state.address || '', 'optional - street / stand number')
   return lines
 }
 
@@ -549,11 +549,11 @@ export function renderListingForm(state: ListingFormState, senderPhone: string):
     (state.address ? 1 : 0)
 
   return [
-    `🏪 *Your listing* — ${filledCount}/10 ready`,
+    `🏪 *Your listing* - ${filledCount}/10 ready`,
     '',
     ...fieldLines(state, senderPhone),
     '',
-    ...(state.logo ? ['📷 Logo: photo attached — uploads at publish', ''] : []),
+    ...(state.logo ? ['📷 Logo: photo attached - uploads at publish', ''] : []),
     'To edit a field, type the heading and new value (e.g. *Prices: $5 - $20*). Tap ↗ Publish when ready, or *cancel* to quit.',
   ].join('\n')
 }
@@ -568,11 +568,11 @@ export function missingRequired(state: ListingFormState): string[] {
 
 export function renderMissingRequiredList(state: ListingFormState): string {
   const missing = missingRequired(state)
-  const lines = ['⚠️ *Not ready to publish* — fill the mandatory fields first:', '']
+  const lines = ['⚠️ *Not ready to publish* - fill the mandatory fields first:', '']
   for (const f of missing) {
-    if (f === 'name') lines.push('⬜ *Name* — just send it, e.g. "Job Moyo Hardware"')
-    if (f === 'category') lines.push('⬜ *Category* — e.g. Salon, Bakery, Electrician, Building Materials…')
-    if (f === 'phone') lines.push('⬜ *Phone* — send a number, or reply *me* to use your WhatsApp number')
+    if (f === 'name') lines.push('⬜ *Name* - just send it, e.g. "Job Moyo Hardware"')
+    if (f === 'category') lines.push('⬜ *Category* - e.g. Salon, Bakery, Electrician, Building Materials…')
+    if (f === 'phone') lines.push('⬜ *Phone* - send a number, or reply *me* to use your WhatsApp number')
   }
   lines.push('')
   lines.push('Everything else (city, description, prices…) is optional but helps customers find you.')
@@ -580,7 +580,7 @@ export function renderMissingRequiredList(state: ListingFormState): string {
 }
 
 export const LIST_INTRO = (): string => [
-  "Let's list your business on WA Directory — send a quick line or a full paragraph, and I'll fill the form.",
+  "Let's list your business on WA Directory - send a quick line or a full paragraph, and I'll fill the form.",
   '',
   'Fields I pick from your text: name, category, city, phone, prices, description, website, catalog, address.',
   '',
@@ -588,7 +588,7 @@ export const LIST_INTRO = (): string => [
   'Bread Machine Store in Harare, contact 077123 4567, sells bread from $1',
   'Catalog: https://wa.me/c/263771234567',
   '',
-  'Prices work best as a range — your cheapest item to your most expensive.',
+  'Prices work best as a range - your cheapest item to your most expensive.',
   '',
   'Reply *cancel* to stop anytime.',
 ].join('\n')
@@ -612,9 +612,9 @@ export const LIST_WIZARD_STEPS: WizardStep[] = [
   { key: 'categories', label: 'Category', optional: false,
     prompt: 'What type of business is it? Send one word, e.g. *Salon*, *Bakery*, *Electrician*, *Hardware*…' },
   { key: 'city', label: 'Town', optional: false,
-    prompt: 'Which town/city is your business physically located in? e.g. *Harare*, *Bulawayo*, *Gweru*…\n(This is just your physical location — you can still serve other areas. Reply *whole country* if you serve everywhere online, or *remote* if you have no physical shop.)' },
+    prompt: 'Which town/city is your business physically located in? e.g. *Harare*, *Bulawayo*, *Gweru*…\n(This is just your physical location - you can still serve other areas. Reply *whole country* if you serve everywhere online, or *remote* if you have no physical shop.)' },
   { key: 'phone', label: 'Phone', optional: false,
-    prompt: 'What number should customers reach you on? Send it, or reply *me* to use this WhatsApp number.\n(Reply *call only* if customers should just call it — not on WhatsApp.)\n\n*Note: Only Zimbabwean numbers are accepted (e.g. 077, 078, 071, 073, 075, 077, 078).*' },
+    prompt: 'What number should customers reach you on? Send it, or reply *me* to use this WhatsApp number.\n(Reply *call only* if customers should just call it - not on WhatsApp.)\n\n*Note: Only Zimbabwean numbers are accepted (e.g. 077, 078, 071, 073, 075, 077, 078).*' },
   { key: 'area', label: 'Service Areas', optional: true,
     prompt: 'Which suburbs or areas do you serve? You can list multiple, e.g. *Avondale, Mufakose, Highfield*.\n(If you entered "whole country" or "remote" above, you can skip this.)' },
   { key: 'price_range', label: 'Prices', optional: true,
@@ -622,13 +622,13 @@ export const LIST_WIZARD_STEPS: WizardStep[] = [
   { key: 'description', label: 'Description', optional: true,
     prompt: 'In one line, what do you sell or do?' },
   { key: 'website', label: 'Website', optional: true,
-    prompt: 'Do you have a website? Send the link, e.g. *www.myshop.co.zw*.\n(If you don\'t have one, just reply *skip* — a website will be created for you upon payment, linked to your WhatsApp.)' },
+    prompt: 'Do you have a website? Send the link, e.g. *www.myshop.co.zw*.\n(If you don\'t have one, just reply *skip* - a website will be created for you upon payment, linked to your WhatsApp.)' },
   { key: 'catalog', label: 'Catalog', optional: true,
     prompt: 'Have a WhatsApp catalog or price list link? Send it, e.g. *wa.me/c/…*.\n(You can copy your WhatsApp catalog link and paste it here for easy sharing.)' },
   { key: 'address', label: 'Address', optional: true,
     prompt: 'Physical address or stand number?' },
   { key: 'logo', label: 'Logo photo', optional: true,
-    prompt: 'Last one 📷 — send a photo of your logo or shop front.' },
+    prompt: 'Last one 📷 - send a photo of your logo or shop front.' },
 ]
 
 export function wizardStepAnswered(state: ListingFormState, key: WizardStep['key']): boolean {
@@ -655,10 +655,10 @@ export function firstUnansweredWizardStep(state: ListingFormState): number {
 }
 
 export const wizardProgress = (i: number): string =>
-  `📝 *Registration — question ${i + 1} of ${LIST_WIZARD_STEPS.length}*`
+  `📝 *Registration - question ${i + 1} of ${LIST_WIZARD_STEPS.length}*`
 
 export const wizardIntro = (): string => [
-  "Great — let's list your business. I'll ask a few quick questions, one at a time.",
+  "Great - let's list your business. I'll ask a few quick questions, one at a time.",
   '',
   'Every optional question accepts *skip*. Reply *back* to fix an earlier answer, or *cancel* to stop.',
 ].join('\n')

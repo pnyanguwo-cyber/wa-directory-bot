@@ -1,4 +1,4 @@
-﻿// lib/radar.ts — S18.5 Supplier Demand Radar
+// lib/radar.ts — S18.5 Supplier Demand Radar
 // Every user search (minus masked/sensitive terms) is stored as an
 // anonymized demand event. Verified suppliers opt in via bot_settings
 // (radar_sub:<digits> = '' | 'all' | lowercase city), get pinged with the
@@ -109,7 +109,7 @@ export async function pingSuppliersDemand(ev: {
   try {
     const subs = await listDemandSubscribers()
     const body = [
-      `📡 *Radar ping* — someone searched "${ev.term}"${ev.city ? ` in ${ev.city}` : ''} on wa.directory (${ev.result_count} result${ev.result_count === 1 ? '' : 's'}).`,
+      `📡 *Radar ping* - someone searched "${ev.term}"${ev.city ? ` in ${ev.city}` : ''} on wa.directory (${ev.result_count} result${ev.result_count === 1 ? '' : 's'}).`,
       'Reply `claim` to take this lead and get the buyer\'s consent.',
     ].join('\n')
     for (const sub of subs) {
