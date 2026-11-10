@@ -12,7 +12,6 @@ import {
   sendContactCard,
   markRead,
   sendWhatsAppTemplate,
-  sendWhatsAppImage,
 } from '@wa-directory/shared'
 import type { InteractiveRow, InteractiveButton } from '@wa-directory/shared'
 import { monoUSD } from '@wa-directory/shared'
@@ -20,6 +19,22 @@ import { logBotMessage, logBotSearch } from '@wa-directory/shared'
 import { orderSearchResults } from '@wa-directory/shared'
 import { expandSearchQuery, classifyIntent } from '@wa-directory/shared'
 import type { Business } from '@wa-directory/shared'
+import {
+  startRegistrationFlow,
+  chooseRegistrationPlan,
+  handleRegistrationMessage,
+  handleRegistrationImage,
+  REGISTRATION_BUTTONS,
+} from '@wa-directory/shared'
+import {
+  getConversationState,
+  setConversationState,
+  updateConversationContext,
+  clearConversationState,
+  hasActiveOnboardingState,
+  ConversationState,
+} from '@wa-directory/shared'
+import { TRIAL_PLAN_LABEL } from '@wa-directory/shared'
 import {
   getSession,
   saveSession,
@@ -1118,11 +1133,6 @@ async function wizardAdvance(
   const idx = nextWizardIndex(state, fromIndex)
   await saveSession(from, 'list_form', { ...session.data, list: state, wizard: idx } as ChatSessionData)
   if (idx < 0) {
-    await sendWhatsAppImage(
-      from,
-      'https://images.unsplash.com/photo-1509440159596-0249088772ff',
-      '📦 *How to list your products & prices*\n\nOnce your business goes live, you can add products to your shop shelf anytime by sending a photo with a caption that includes the product name and price, e.g.:\n\n*bread $2*\n*cake $15*\n\nYou can also add extra details in the caption like *\"i make home deliveries and customize cakes to your liking\"*.\n\nProducts without photos are fully accepted too!\n\n📸 *Photo tips:* While optional, we strongly recommend uploading original photos of your actual products - this builds customer trust. Please avoid internet-sourced or AI-generated images. If we detect non-original images, they may be removed.'
-    )
     await sendFormUpdate(
       from,
       state,
@@ -1519,24 +1529,21 @@ async function resumePaused(from: string, session: ChatSession | null): Promise<
   }
 }
 
-// ✎ Register opens with the honest price list, then routes to the flow that
-// matches what the user is adding: a business subscription or paid personal
-// contacts — never both silently merged.
+// ✎ Register opens with the choice of what to add: a business listing
+// (90-day free trial or $2/month paid) or a paid personal contact.
 async function sendRegisterChoice(from: string) {
   await clearSession(from)
+  await clearConversationState(from)
   await sendInteractiveButtons(
     from,
     [
       '✎ *Registering on WA Directory*',
       '',
-      '• Business subscription - USD 1 per month',
-      '• Personal contact - $1/month, $5/6 months or $10/year',
-      '',
       'Which are you adding?',
     ].join('\n'),
     [
-      { id: 'reg_personal', title: 'Personal contact $1/mo' },
-      { id: 'reg_business', title: '• Business $1/mo' },
+      { id: 'reg_personal', title: 'Personal contact' },
+      { id: 'reg_business', title: 'Business listing' },
       { id: 'cancel', title: '✖ Cancel' },
     ]
   )
@@ -1737,6 +1744,7 @@ async function sendFormUpdate(from: string, state: ListingFormState, tailNote?: 
   if (text.length <= 1020) {
     await sendInteractiveButtons(from, text, [
       { id: 'list_publish', title: '↗ Publish' },
+      { id: 'list_edit', title: '✏️ Edit' },
       { id: 'list_cancel', title: '✖ Cancel' },
     ])
   } else {
@@ -2562,7 +2570,8 @@ async function handlePaySearchText(from: string, session: ChatSession, text: str
     if (!trailing || /^(?:me|my business|my company|my shop|myself|us)$/i.test(trailing)) {
       await sendRegisterChoice(from)
     } else {
-      await startRegister(from, trailing)
+      // User typed something like "register my bakery" - start with the new flow
+      await startRegistrationFlow(from)
     }
     return
   }
@@ -4382,22 +4391,9 @@ async function handleAction(from: string, session: ChatSession | null, action: s
       return
     }
     case 'menu_register': {
-      // A registration shelved by an earlier direction change gets offered
-      // back before a fresh one starts.
-      const draft = pausedDraft(session || (await getSession(from)))
-      if (draft && familyOf(draft.step) === 'register') {
-        await sendWhatsAppMessage(
-          from,
-          'You left a registration part-way through. Continue it, or start over?'
-        )
-        await sendInteractiveButtons(from, '', [
-          { id: 'resume_paused', title: '▶ Continue my draft' },
-          { id: 'reg_restart', title: '✎ Start over' },
-          { id: 'cancel', title: '✖ Cancel' },
-        ])
-        return
-      }
-      await sendRegisterChoice(from)
+      // The new flow handles resume via Supabase state automatically.
+      // Just start the registration flow - it will detect and resume any in-progress registration.
+      await startRegistrationFlow(from)
       return
     }
     case 'resume_paused': {
@@ -4410,7 +4406,7 @@ async function handleAction(from: string, session: ChatSession | null, action: s
       await sendRegisterChoice(from)
       return
     case 'reg_business':
-      await startRegister(from)
+      await startRegistrationFlow(from)
       return
     case 'reg_personal': {
       await saveSession(from, 'reg_contact', {})
@@ -4470,7 +4466,17 @@ async function handleAction(from: string, session: ChatSession | null, action: s
       if (session?.step === 'list_form') {
         await tryPublishForm(from, session, msgId)
       } else {
-        await startRegister(from)
+        await startRegistrationFlow(from)
+      }
+      return
+    }
+    case 'list_edit': {
+      if (session?.step === 'list_form') {
+        const before = session.data.list || {}
+        await saveSession(from, 'list_form', { ...session.data, list: before, wizard: 0 } as ChatSessionData)
+        await sendWizardQuestion(from, before, 0, "Let's go through your answers again - *Skip* anything you want to keep.")
+      } else {
+        await startRegistrationFlow(from)
       }
       return
     }
@@ -4499,7 +4505,7 @@ async function handleAction(from: string, session: ChatSession | null, action: s
       return
     case 'pay_new':
       await clearSession(from)
-      await startRegister(from)
+      await startRegistrationFlow(from)
       return
     case 'pay_1m':
     case 'pay_6m':
@@ -4512,6 +4518,22 @@ async function handleAction(from: string, session: ChatSession | null, action: s
       await clearSession(from)
       await sendWhatsAppMessage(from, await helpText(from))
       return
+    // New registration flow buttons
+    case 'reg_plan_trial':
+    case 'reg_plan_paid':
+    case 'reg_upload':
+    case 'reg_skip':
+    case 'reg_proceed':
+    case 'reg_edit': {
+      const convState = await getConversationState(from)
+      if (convState && convState.state.startsWith('REGISTRATION_')) {
+        await handleRegistrationMessage(from, action, convState.context)
+        return
+      }
+      // Fallback: no registration state, just show plan choice
+      await startRegistrationFlow(from)
+      return
+    }
     case 'whole_country':
       if (session?.step === 'search_loc' && session.data.pending_search_term) {
         await clearSession(from)
@@ -5762,41 +5784,49 @@ async function publishBusiness(from: string, session: ChatSession, msgId?: strin
   // that the form truly landed before the long status message arrives.
   if (msgId) await sendReaction(from, msgId, '✅').catch(() => {})
 
-  await sendWhatsAppMessage(
-    from,
-    [
-      '🎉 *Submitted for Approval!*',
-      '',
-      `Your business "${name}" is now pending review.`,
-      'Once an admin approves it you will get a confirmation here.',
-      '',
-      result.pendingPayment
-        ? '💵 To go live: pay USD 1 - I will ask for your EcoCash number next (or pay at ' + SITE_URL + '/pay)'
-        : '⭐ Public-service listing: our team verifies it fast.',
-      '',
-      '📸 *After go-live:* send a product photo with a caption that includes the product name and price (e.g. *bread $2*), and you can add extra details like *\"i make home deliveries and customize cakes to your liking\"*.',
-      'The bot will format it beautifully: it will quote your description, **bold the name**, and `inline-code` the price.',
-      '',
-      '📸 *Photo tips:* While optional, we strongly recommend uploading original photos of your actual products - this builds customer trust. Please avoid internet-sourced or AI-generated images. If we detect non-original images, they may be removed.',
-      '',
-      `✏️ Save this link to edit your listing later:`,
-      `${SITE_URL}/edit?token=${token}`,
-      '',
-      `🔐 Create your portal account (stats, conversations, ranking):`,
-      `${SITE_URL}/account-setup?token=${token}`,
-      '',
-      `📱 Your QR codes (chat + portal): print them for customers:`,
-      `${SITE_URL}/my-qr/${slug}`,
-      '',
-      'Reply *help* anytime.',
-    ].join('\n')
-  )
-
-  // Pay now from chat: ask which EcoCash number gets the PIN prompt (the
-  // payer's own number or *me* for this chat), push the Paynow EcoCash
-  // request, and let /api/paynow/result auto-confirm — no admin step.
   if (result.pendingPayment) {
+    // Paid row: no links or pitch yet — the go-live bundle arrives with the
+    // payment-confirmed activation message (lib/listing-activation.ts) once
+    // /api/paynow/result verifies the EcoCash payment.
     await askEcoCashNumber(from, { id: result.businessId, name }, '1m')
+  } else {
+    await sendWhatsAppMessage(
+      from,
+      [
+        '🎉 *Submitted for Approval!*',
+        '',
+        `Your business "${name}" is now pending review.`,
+        'Once an admin approves it you will get a confirmation here.',
+        '',
+        '⭐ Public-service listing: our team verifies it fast.',
+        '',
+        '📸 *After go-live:* send a product photo with a caption that includes the product name and price (e.g. *bread $2*), and you can add extra details like *"i make home deliveries and customize cakes to your liking"*.',
+        'The bot will format it beautifully: it will quote your description, **bold the name**, and `inline-code` the price.',
+        '',
+        '📸 *Photo tips:* While optional, we strongly recommend uploading original photos of your actual products - this builds customer trust. Please avoid internet-sourced or AI-generated images. If we detect non-original images, they may be removed.',
+        '',
+        `✏️ Save this link to edit your listing later:`,
+        `${SITE_URL}/edit?token=${token}`,
+        '',
+        `🔐 Create your portal account (stats, conversations, ranking):`,
+        `${SITE_URL}/account-setup?token=${token}`,
+        '',
+        `📱 Your QR codes (chat + portal): print them for customers:`,
+        `${SITE_URL}/my-qr/${slug}`,
+        '',
+        'Reply *help* anytime.',
+      ].join('\n')
+    )
+  }
+
+  // One-time channel pitch while the registration window is open: this is
+  // where live buyer needs surface, and quoting is one reply. Paid rows
+  // already get this with the activation message.
+  if (!result.pendingPayment) {
+    const chLink = await channelLinkRaw()
+    if (chLink) {
+      await sendWhatsAppMessage(from, renderChannelPitch(chLink)).catch(() => {})
+    }
   }
 
   // One-time channel pitch while the registration window is open: this is
@@ -6482,6 +6512,23 @@ export async function POST(request: Request) {
           continue
         }
 
+        // ── New registration flow (REGISTRATION_* states from Supabase) ───────
+        const convState = await getConversationState(from)
+        if (convState && convState.state.startsWith('REGISTRATION_')) {
+          // Handle image messages
+          if (mediaKind === 'image') {
+            const media = await fetchWhatsAppMedia(message.id)
+            if (media) {
+              const imageBytes = new Uint8Array(media.buffer)
+              await handleRegistrationImage(from, imageBytes, '')
+              continue
+            }
+          }
+          // Handle text messages
+          await handleRegistrationMessage(from, text, convState.context)
+          continue
+        }
+
         // ── Living list-form: parse + re-render after every reply ──────
         if (session?.step === 'list_form') {
           if (lower === 'cancel' || lower === 'help') {
@@ -6591,7 +6638,8 @@ export async function POST(request: Request) {
           if (!trailing || /^(?:me|my business|my company|my shop|myself|us)$/i.test(trailing)) {
             await sendRegisterChoice(from)
           } else {
-            await startRegister(from, trailing)
+            // User typed something like "register my bakery" - start with the new flow
+            await startRegistrationFlow(from)
           }
           continue
         }
