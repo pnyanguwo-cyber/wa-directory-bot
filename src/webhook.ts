@@ -5474,11 +5474,29 @@ async function handleClaimTap(from: string, session: ChatSession | null, orderId
     return
   }
   const buyer = digitsOnly(row.buyer_phone)
-  const summary = ((row.lines || []) as { name: string; qty: number }[])
-    .map(l => `${l.qty} × ${l.name}`)
-    .join(', ')
-  const plain = `${row.biz_name} confirmed your order (${summary}). Their number: ${digits ? '+' + digits : 'on the listing web page'}.`
-  await sendWhatsAppMessage(buyer, plain)
+  // The buyer's status update repeats the order exactly as they confirmed it:
+  // every line with its quantity, the line total and the order total.
+  const lines = (row.lines || []) as { name: string; qty: number; price: number | null }[]
+  const itemLines = lines.map(
+    l =>
+      `· ${l.qty} × ${l.name}` +
+      (l.price != null ? ` - ${monoUSD(l.price * l.qty).replace(/`/g, '')}` : '')
+  )
+  const allPriced = lines.length > 0 && lines.every(l => l.price != null)
+  const total = lines.reduce((sum, l) => sum + (l.price ?? 0) * l.qty, 0)
+  await sendWhatsAppMessage(
+    buyer,
+    [
+      '✅ *Order confirmed*',
+      '',
+      `🏪 *${row.biz_name}*${row.city ? `, ${row.city}` : ''}`,
+      ...itemLines,
+      ...(allPriced ? ['', `*Total: ${monoUSD(total).replace(/`/g, '')}*`] : []),
+      '',
+      digits ? `📱 Shop: +${digits}` : '📱 The shop number is on their listing page.',
+      `🧾 Order: wa.directory/go/o/${row.token}`,
+    ].join('\n')
+  )
   if (digits) {
     await sendCtaUrl(
       buyer,
