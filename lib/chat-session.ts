@@ -48,6 +48,8 @@ export interface ChatSessionData {
   // Supplier is typing an optional note for a buyer on a confirmed order.
   order_note_id?: number
   order_note_token?: string
+  // Supplier is typing a counter-price for that order.
+  order_counter_id?: number
   // Where the search originated, so Back can restore the previous prompt.
   origin?: 'search_loc' | 'search_term' | 'free'
   // Search label of the current results, for Back re-rendering.

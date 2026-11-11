@@ -56,6 +56,7 @@ import {
 import { fetchBusinessItems } from '@wa-directory/shared'
 import { compileOrderText } from '@wa-directory/shared'
 import { parseOrderLine, matchOrder, type ShelfSupplier, type OrderPair, type MatchResult } from '../lib/order-intake.js'
+import { parseCounterPrices, sumLines } from '../lib/counter-price.js'
 import {
   DATA_ENTRY_STEPS,
   detectPivot,
@@ -66,7 +67,7 @@ import {
 } from '../lib/intent-pivot.js'
 import {
   createSupplyOrder, recordOrderOpen, claimSupplyOrder, getSupplyOrderById, listOrdersForBusiness,
-  listOrdersForBuyer, orderStats, type SupplyOrderRow,
+  listOrdersForBuyer, orderStats, type SupplyOrderRow, type SupplyOrderLine,
 } from '@wa-directory/shared'
 import { getSupabase } from '@wa-directory/shared'
 import { upsertBotContact, markBotContactOptOut, setBotContactOptIn, hasSeenContact, sweepIdleNudges, getBotContactName } from '../lib/bot-contacts.js'
@@ -4260,6 +4261,61 @@ async function handleAction(from: string, session: ChatSession | null, action: s
     await sendWhatsAppMessage(from, '👍 No note sent - the buyer already has your number.')
     return
   }
+  const coNote = action.match(/^co_note_(\d+)$/)
+  if (coNote) {
+    const row = await getSupplyOrderById(Number(coNote[1]))
+    if (!row) {
+      await sendWhatsAppMessage(from, 'That order is gone - send *orders* to see the current ones.')
+      return
+    }
+    await saveSession(from, 'order_note', { ...(session?.data || {}), order_note_id: row.id })
+    await sendWhatsAppMessage(
+      from,
+      `✍️ Send the message for the buyer of wa.directory/go/o/${row.token} - a price, pickup note, anything.`
+    )
+    return
+  }
+  const coPrice = action.match(/^co_price_(\d+)$/)
+  if (coPrice) {
+    const row = await getSupplyOrderById(Number(coPrice[1]))
+    if (!row) {
+      await sendWhatsAppMessage(from, 'That order is gone - send *orders* to see the current ones.')
+      return
+    }
+    const lines = (row.lines || []) as { name: string; qty: number; price: number | null }[]
+    await saveSession(from, 'order_counter', {
+      ...(session?.data || {}),
+      order_counter_id: row.id,
+    })
+    await sendWhatsAppMessage(
+      from,
+      [
+        `💰 *New price* for wa.directory/go/o/${row.token}`,
+        '',
+        ...lines.map(
+          (l, n) =>
+            `${n + 1}. ${l.qty} × ${l.name}${l.price != null ? ` - ${monoUSD(l.price).replace(/`/g, '')} each` : ''}`
+        ),
+        '',
+        lines.length === 1
+          ? 'Send the new price, e.g. *3.50*.'
+          : 'Send one price per item as number=price, e.g. *1=3.50 2=20*.',
+        '',
+        'The buyer has to accept before it applies. Reply *cancel* to leave prices alone.',
+      ].join('\n')
+    )
+    return
+  }
+  const coYes = action.match(/^co_yes_(\d+)$/)
+  if (coYes) {
+    await answerCounter(from, Number(coYes[1]), true)
+    return
+  }
+  const coNo = action.match(/^co_no_(\d+)$/)
+  if (coNo) {
+    await answerCounter(from, Number(coNo[1]), false)
+    return
+  }
   if (action === 'oedit') {
     await saveSession(from, 'order', { ...session?.data, pendingOrder: undefined })
     await sendWhatsAppMessage(
@@ -5586,9 +5642,126 @@ async function handleClaimTap(from: string, session: ChatSession | null, orderId
   })
   await sendInteractiveButtons(
     from,
-    '✅ Noted — your buyer has your number.\n\nWant to add a message for them? A price adjustment, pickup note, anything. Reply with it now, or skip.',
-    [{ id: 'note_skip', title: '⏭ Skip' }]
+    '✅ Noted — your buyer has your number.\n\nAnything to change? Send a message, or change the price.',
+    [
+      { id: `co_price_${row.id}`, title: '💰 Change price' },
+      { id: `co_note_${row.id}`, title: '💬 Add a message' },
+      { id: 'note_skip', title: '⏭ Skip' },
+    ]
   )
+}
+
+/** Rewrite the order's prices to the shop's counter-offer and ask the buyer to
+ * accept or decline. The totals the buyer sees are the stored ones. */
+async function applyCounterPrices(
+  from: string,
+  session: ChatSession,
+  row: SupplyOrderRow,
+  prices: number[]
+) {
+  const oldLines = (row.lines || []).map(l => ({ ...l }))
+  const newLines = oldLines.map((l, n) => ({ name: l.name, qty: l.qty, price: prices[n] }))
+  const oldTotal = sumLines(oldLines)
+  const newTotal = sumLines(newLines)
+  const trace = [...(row.trace || []), { event: 'counter', at: new Date().toISOString(), oldTotal, newTotal, oldLines }]
+  await getSupabase().from('supply_orders').update({ lines: newLines, trace }).eq('id', row.id)
+
+  const buyer = digitsOnly(row.buyer_phone)
+  if (buyer) {
+    await sendWhatsAppMessage(
+      buyer,
+      [
+        `💰 *${row.biz_name}* changed the price on your order`,
+        `🧾 wa.directory/go/o/${row.token}`,
+        '',
+        ...newLines.map(l =>
+          `· ${l.qty} × ${l.name} - ${monoUSD((l.price ?? 0) * l.qty).replace(/`/g, '')}`
+        ),
+        '',
+        `*New total: ${monoUSD(newTotal).replace(/`/g, '')}* (was ${monoUSD(oldTotal).replace(/`/g, '')})`,
+        '',
+        'Accept the new price, or decline and the original price stands.',
+      ].join('\n')
+    )
+    await sendInteractiveButtons(buyer, 'Your call:', [
+      { id: `co_yes_${row.id}`, title: '✅ Accept' },
+      { id: `co_no_${row.id}`, title: '❌ Decline' },
+    ])
+  }
+
+  await resetForNewSearch(from, session)
+  await sendWhatsAppMessage(
+    from,
+    buyer
+      ? `📤 Sent to the buyer: *${monoUSD(newTotal).replace(/`/g, '')}*, up from *${monoUSD(oldTotal).replace(/`/g, '')}*. Nothing changes until they accept.`
+      : 'Saved, but this order has no buyer number to ask.'
+  )
+}
+
+/** Buyer taps Accept / Decline on a counter-price. Accept keeps the new lines;
+ * decline restores the prices captured when the counter was made. */
+async function answerCounter(from: string, orderId: number, accept: boolean) {
+  const row = await getSupplyOrderById(orderId)
+  if (!row) {
+    await sendWhatsAppMessage(from, 'That order is gone - send *orders* to see the current ones.')
+    return
+  }
+  if (digitsOnly(row.buyer_phone) !== digitsOnly(from)) {
+    await sendWhatsAppMessage(from, 'Only the buyer on this order can answer.')
+    return
+  }
+  const counters = (row.trace || []).filter(
+    (t): t is { event: string; oldTotal: number; newTotal: number; oldLines: SupplyOrderLine[] } =>
+      (t as { event?: string }).event === 'counter'
+  )
+  const last = counters[counters.length - 1]
+  if (!last) {
+    await sendWhatsAppMessage(from, 'There is no price change on this order.')
+    return
+  }
+  const shopPhone = await businessWhatsAppDigits(row.biz_id)
+  const lines = accept ? (row.lines || []) : (last.oldLines || [])
+  const total = sumLines(lines)
+  const trace = [
+    ...(row.trace || []),
+    { event: accept ? 'counter-accepted' : 'counter-declined', at: new Date().toISOString() },
+  ]
+  await getSupabase().from('supply_orders').update({ lines, trace }).eq('id', row.id)
+
+  await sendWhatsAppMessage(
+    from,
+    accept
+      ? `✅ Price accepted. Your order with *${row.biz_name}* stands at *${monoUSD(total).replace(/`/g, '')}*.`
+      : `👍 Declined. The original price stands at *${monoUSD(total).replace(/`/g, '')}* - chat the shop if you want to settle on something else.`
+  )
+  if (shopPhone) {
+    await sendWhatsAppMessage(
+      shopPhone,
+      accept
+        ? `✅ The buyer accepted your price for wa.directory/go/o/${row.token}: *${monoUSD(total).replace(/`/g, '')}*. Confirm delivery details with them.`
+        : `❌ The buyer declined your price for wa.directory/go/o/${row.token}. The original *${monoUSD(total).replace(/`/g, '')}* stands - message them if you want to negotiate.`
+    )
+  }
+  await notifyAdminsText(
+    [
+      accept ? '💰 *Counter-price accepted*' : '❌ *Counter-price declined*',
+      `• ${row.biz_name} · wa.directory/go/o/${row.token}`,
+      `• Buyer: +${digitsOnly(row.buyer_phone)}`,
+      `• ${accept ? 'New' : 'Original'} total: ${monoUSD(total).replace(/`/g, '')}`,
+    ].join('\n')
+  )
+}
+
+/** WhatsApp digits for a business id ('' when voice-only / unknown). */
+async function businessWhatsAppDigits(bizId: string | null): Promise<string> {
+  if (!bizId) return ''
+  const { data } = await getSupabase()
+    .from('businesses')
+    .select('phone, phone_type, whatsapp_link')
+    .eq('id', bizId)
+    .maybeSingle()
+  const b = data as { phone: string | null; phone_type: string | null; whatsapp_link: string | null } | null
+  return b ? await cartWaDigits(b.phone_type, b.phone || '', b.whatsapp_link) : ''
 }
 
 /** Relay a supplier's note (often a new price) to the buyer of a confirmed
@@ -6571,6 +6744,36 @@ export async function POST(request: Request) {
             continue
           }
           // Admins fall through: their phone works as a normal user too.
+        }
+
+        // ── Supplier's counter-price on a confirmed order ───────────────
+        if (session?.step === 'order_counter') {
+          if (!text) continue
+          if (/^(?:skip|cancel|no|none)$/i.test(lower.trim())) {
+            await resetForNewSearch(from, session)
+            await sendWhatsAppMessage(from, '👍 Prices left as they were.')
+            continue
+          }
+          const orderId = Number(session.data.order_counter_id)
+          const row = Number.isFinite(orderId) ? await getSupplyOrderById(orderId) : null
+          if (!row) {
+            await resetForNewSearch(from, session)
+            await sendWhatsAppMessage(from, 'That order is no longer open - send *orders* to see the current ones.')
+            continue
+          }
+          const lines = (row.lines || []) as { name: string; qty: number; price: number | null }[]
+          const prices = parseCounterPrices(text, lines)
+          if (!prices) {
+            await sendWhatsAppMessage(
+              from,
+              lines.length === 1
+                ? 'Send a price like *3.50*, or *cancel* to leave it.'
+                : `Send one price per item as number=price, e.g. *1=3.50 2=20* (there are ${lines.length} items), or *cancel*.`
+            )
+            continue
+          }
+          await applyCounterPrices(from, session, row, prices)
+          continue
         }
 
         // ── Supplier's optional note on a just-confirmed order ──────────
