@@ -6754,7 +6754,7 @@ export async function POST(request: Request) {
           .trim()
           .match(/^(register|list me|list my|list on|list|get listed|add my business|sign me up|advertise\b|sell\b.*\b(list|advertise|get listed)\b|i want to (list|sell|advertise)|join\b)\b(.*)$/i)
         if (mReg) {
-          const trailing = mReg[3].trim()
+          const trailing = mReg[4].trim()
           if (!trailing || /^(?:me|my business|my company|my shop|myself|us)$/i.test(trailing)) {
             await sendRegisterChoice(from)
           } else {
