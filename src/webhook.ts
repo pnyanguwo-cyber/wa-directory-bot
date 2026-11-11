@@ -4356,6 +4356,14 @@ async function handleAction(from: string, session: ChatSession | null, action: s
     return
   }
 
+  // Back from the cart's confirm screen to the quantity controls.
+  if (action === 'cart_edit') {
+    const data = { ...(session?.data || {}), pendingOrder: undefined }
+    await saveSession(from, 'browse', data)
+    await handleViewCart(from, { phone: from, step: 'browse', data })
+    return
+  }
+
   // Change quantity: cart_item_<itemId> opens the item, cart_inc|dec|del_<id>
   const cartItemMatch = action.match(/^cart_item_(.+)$/)
   if (cartItemMatch) {
@@ -5312,7 +5320,13 @@ async function commitPendingOrder(from: string, session: ChatSession | null) {
         .eq('id', row.id)
     }
   }
-  await saveSession(from, 'browse', { ...session.data, pendingOrder: undefined, lastScreen: 'list' })
+  await saveSession(from, 'browse', {
+    ...session.data,
+    pendingOrder: undefined,
+    lastScreen: 'list',
+    // A committed cart is done — empty it so the next tap starts fresh.
+    cart: [],
+  })
   await sendWhatsAppMessage(
     from,
     renderOrderSent(
@@ -5354,8 +5368,18 @@ async function pushOrderToSupplier(row: SupplyOrderRow, buyerPhone: string): Pro
     '🧾 *New order on WA Directory*',
     '',
     ...((row.lines || []) as { name: string; qty: number; price: number | null }[]).map(
-      l => `• ${l.qty} × ${l.name}${l.price != null ? ` - $${l.price}` : ''}`
+      l =>
+        `• ${l.qty} × ${l.name}` +
+        (l.price != null ? ` - ${monoUSD(l.price * l.qty).replace(/`/g, '')} (${monoUSD(l.price).replace(/`/g, '')} each)` : '')
     ),
+    '',
+    ...(() => {
+      const lines = (row.lines || []) as { qty: number; price: number | null }[]
+      const total = lines.reduce((sum, l) => sum + (l.price ?? 0) * l.qty, 0)
+      return lines.length && lines.every(l => l.price != null)
+        ? [`*Total: ${monoUSD(total).replace(/`/g, '')}*`, '']
+        : []
+    })(),
     '',
     `Buyer: +${digitsOnly(buyerPhone)}`,
     `Checkout: ${shortUrl}`,
@@ -5371,7 +5395,9 @@ async function pushOrderToSupplier(row: SupplyOrderRow, buyerPhone: string): Pro
   if (active) {
     try {
       await sendWhatsAppMessage(digits, body)
-      await sendInteractiveButtons(digits, '', [{ id: `oclaim_${row.id}`, title: '✅ I can supply' }])
+      await sendInteractiveButtons(digits, 'Can you supply this order?', [
+        { id: `oclaim_${row.id}`, title: '✅ I can supply' },
+      ])
       await bumpOrderTrace(row.id, { event: 'push-dm', at: new Date().toISOString() })
       return true
     } catch {
@@ -5895,23 +5921,46 @@ async function handleCheckoutCart(from: string, session: ChatSession | null) {
     return
   }
 
-  // For each business group, create supply orders (or link existing ones)
+  // Resolve each shop's WhatsApp target and town once, then hand the cart to
+  // the same verify screen the typed-order flow uses — so the quantities the
+  // buyer just set are what the confirm card, the supply_orders rows and the
+  // supplier message all show. Nothing is sent until they confirm.
+  const { data: shopRows } = await getSupabase()
+    .from('businesses')
+    .select('id, phone, phone_type, whatsapp_link, city')
+    .in('id', summary.groups.map(g => g.businessId))
+  const shops = new Map(
+    (
+      (shopRows as
+        | { id: string; phone: string | null; phone_type: string | null; whatsapp_link: string | null; city: string | null }[]
+        | null) || []
+    ).map(r => [r.id, r])
+  )
+
+  const groups: PendingGroup[] = []
   for (const group of summary.groups) {
-    // Create an order for this business
-    await createSupplyOrder({
-      biz_id: group.businessId,
-      biz_name: group.businessName,
-      buyer_phone: from,
-      lines: group.items.map(i => ({
-        name: i.itemName,
-        qty: i.qty,
-        price: i.price
-      }))
+    const shop = shops.get(group.businessId)
+    groups.push({
+      businessId: group.businessId,
+      businessName: group.businessName,
+      supplierDigits: shop
+        ? await cartWaDigits(shop.phone_type, shop.phone || '', shop.whatsapp_link)
+        : '',
+      city: shop?.city || undefined,
+      lines: group.items.map(i => ({ name: i.itemName, qty: i.qty, price: i.price })),
     })
   }
 
-  await clearSession(from)
-  await sendWhatsAppMessage(from, `✅ Orders sent to ${summary.groups.length} supplier(s). I will notify you when they confirm.`)
+  const pendingOrder: PendingOrder = { groups }
+  await saveSession(from, 'order', { ...(session?.data || {}), pendingOrder })
+  await sendWhatsAppMessage(
+    from,
+    `${renderOrderVerify(groups, 'Tap ✅ to send these orders, or 🛒 to change quantities.')}\n\nNothing is sent until you confirm.`
+  )
+  await sendInteractiveButtons(from, 'Send these orders to the shops?', [
+    { id: 'osend', title: '✅ Send all orders' },
+    { id: 'cart_edit', title: '🛒 Edit quantities' },
+  ])
 }
 
 async function handleClearCart(from: string, session: ChatSession | null) {
@@ -6676,6 +6725,14 @@ export async function POST(request: Request) {
             // Back = pause ordering (search results stay alive).
             await saveSession(from, 'browse', { ...session.data, pendingOrder: undefined, lastScreen: 'list' })
             await sendWhatsAppMessage(from, 'Ordering paused. Reply a numbered business, or send a new search.')
+            continue
+          }
+          // A cart confirm screen also sits on the 'order' step; cart words must
+          // still reach the quantity controls instead of becoming a search.
+          if (/^(?:cart|check cart|view cart|my cart|edit (?:cart|quantities)|change quantit(?:y|ies))$/.test(lower)) {
+            const data = { ...session.data, pendingOrder: undefined }
+            await saveSession(from, 'browse', data)
+            await handleViewCart(from, { phone: from, step: 'browse', data })
             continue
           }
           if (lower === 'yes' || lower === 'send' || lower === 'checkout' || lower === 'done') {
