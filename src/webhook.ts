@@ -256,6 +256,12 @@ async function helpText(from?: string): Promise<string> {
   return helpLines.join('\n')
 }
 
+// Cancelling used to answer with the full help guide — for a number that owns
+// listings that is the long supplier pitch, which reads as if the bot ignored
+// the "cancel". A cancel now gets a one-line acknowledgement.
+const CANCEL_TEXT =
+  '✖ Cancelled. Send *menu* to see what I can do, or just tell me what you need.'
+
 // Extra admin numbers live in bot_settings.admin_allowlist (JSON array).
 // The env ADMIN_WHATSAPP number is always the undeletable owner.
 async function adminNumbers(): Promise<string[]> {
@@ -1342,9 +1348,13 @@ async function handleIntentPivot(
     shelvedFresh ??
     ({ step: session.step, data: session.data, at: new Date().toISOString() } as PausedDraft)
   const hadDraft = hasProgress(session.data)
-  const ack = hadDraft
-    ? "No problem - plans have changed 👍\nI've set what you were doing aside; reply *resume* to pick it up again."
-    : ''
+  // A typed order is shopping continuing, not a change of plans — the verify
+  // card and *back* already keep the earlier search alive, so "plans have
+  // changed" there only contradicts the message that follows it.
+  const ack =
+    hadDraft && kind !== 'order'
+      ? "No problem - plans have changed 👍\nI've set what you were doing aside; reply *resume* to pick it up again."
+      : ''
   const say = async (line: string) => {
     if (line) await sendWhatsAppMessage(from, line)
   }
@@ -4622,7 +4632,7 @@ async function handleAction(from: string, session: ChatSession | null, action: s
     }
     case 'cancel':
       await clearSession(from)
-      await sendWhatsAppMessage(from, await helpText(from))
+      await sendWhatsAppMessage(from, CANCEL_TEXT)
       return
     // New registration flow buttons
     case 'reg_plan_trial':
@@ -5720,10 +5730,8 @@ async function handleCtaChat(from: string, businessId: string) {
 }
 
 async function handleAddToCart(from: string, session: ChatSession | null, itemId: string, msgId?: string) {
-  if (!session) {
-    await sendWhatsAppMessage(from, 'That item link has expired - search the shop again and tap *Add to cart*.')
-    return
-  }
+  // A tap can arrive long after the browse session expired; the item id in the
+  // button is enough to start the cart, so never drop the tap on a null session.
   // Find item details
   const { data: item } = await getSupabase()
     .from('business_items')
@@ -5736,7 +5744,7 @@ async function handleAddToCart(from: string, session: ChatSession | null, itemId
     return
   }
 
-  const updatedData = addToCart(session.data, {
+  const updatedData = addToCart(session?.data || {}, {
     businessId: item.business_id,
     businessName: (item.businesses as any)?.name || 'Shop',
     itemId: item.id,
@@ -5746,8 +5754,8 @@ async function handleAddToCart(from: string, session: ChatSession | null, itemId
     imageUrl: item.image_url || undefined,
   })
 
-  await saveSession(from, session.step, updatedData)
-  await sendInteractiveButtonsRaw(
+  await saveSession(from, session?.step || 'idle', updatedData)
+  await sendInteractiveButtons(
     from,
     `✅ Added *${item.name}* to your cart.`,
     [
@@ -6343,7 +6351,7 @@ export async function POST(request: Request) {
         if (session?.step === 'need_form') {
           if (lower === 'cancel' || lower === 'help') {
             await clearSession(from)
-            await sendWhatsAppMessage(from, await helpText(from))
+            await sendWhatsAppMessage(from, lower === 'cancel' ? CANCEL_TEXT : await helpText(from))
             continue
           }
           await handleNeedFormText(from, session, text)
@@ -6366,7 +6374,7 @@ export async function POST(request: Request) {
         if (session?.step === 'rating') {
           if (lower === 'cancel' || lower === 'help' || lower === 'back') {
             await clearSession(from)
-            await sendWhatsAppMessage(from, await helpText(from))
+            await sendWhatsAppMessage(from, lower === 'cancel' ? CANCEL_TEXT : await helpText(from))
             continue
           }
           await handleRatingReply(from, session, text)
@@ -6481,7 +6489,7 @@ export async function POST(request: Request) {
           // Waiting for the user's town (term already captured)
           if (lower === 'cancel' || lower === 'help') {
             await clearSession(from)
-            await sendWhatsAppMessage(from, await helpText(from))
+            await sendWhatsAppMessage(from, lower === 'cancel' ? CANCEL_TEXT : await helpText(from))
             continue
           }
           if (lower === 'back' || lower === '0') {
@@ -6520,7 +6528,7 @@ export async function POST(request: Request) {
           // Waiting for the search term (town already captured)
           if (lower === 'cancel' || lower === 'help') {
             await clearSession(from)
-            await sendWhatsAppMessage(from, await helpText(from))
+            await sendWhatsAppMessage(from, lower === 'cancel' ? CANCEL_TEXT : await helpText(from))
             continue
           }
           if (lower === 'back' || lower === '0') {
@@ -6568,7 +6576,7 @@ export async function POST(request: Request) {
           // Verify screen up: finish, fix, or speak a brand-new order line.
           if (lower === 'cancel' || lower === 'help') {
             await clearSession(from)
-            await sendWhatsAppMessage(from, await helpText(from))
+            await sendWhatsAppMessage(from, lower === 'cancel' ? CANCEL_TEXT : await helpText(from))
             continue
           }
           if (lower === 'back') {
@@ -6610,7 +6618,7 @@ export async function POST(request: Request) {
           // more/next pages through the stored candidates.
           if (lower === 'cancel' || lower === 'help') {
             await clearSession(from)
-            await sendWhatsAppMessage(from, await helpText(from))
+            await sendWhatsAppMessage(from, lower === 'cancel' ? CANCEL_TEXT : await helpText(from))
             continue
           }
           if (lower === 'back' || lower === '0') {
@@ -6657,7 +6665,7 @@ export async function POST(request: Request) {
         if (session?.step === 'reg_contact') {
           if (lower === 'cancel' || lower === 'help') {
             await clearSession(from)
-            await sendWhatsAppMessage(from, await helpText(from))
+            await sendWhatsAppMessage(from, lower === 'cancel' ? CANCEL_TEXT : await helpText(from))
             continue
           }
           const c = parseContactLine(text)
@@ -6712,7 +6720,7 @@ export async function POST(request: Request) {
         if (session?.step === 'list_form') {
           if (lower === 'cancel' || lower === 'help') {
             await clearSession(from)
-            await sendWhatsAppMessage(from, await helpText(from))
+            await sendWhatsAppMessage(from, lower === 'cancel' ? CANCEL_TEXT : await helpText(from))
             continue
           }
           if (/^(publish|submit|yes|y|go live)\b/.test(lower)) {
@@ -6727,7 +6735,7 @@ export async function POST(request: Request) {
         if (session?.step === 'item_photo') {
           if (lower === 'cancel' || lower === 'help') {
             await clearSession(from)
-            await sendWhatsAppMessage(from, await helpText(from))
+            await sendWhatsAppMessage(from, lower === 'cancel' ? CANCEL_TEXT : await helpText(from))
             continue
           }
           await handleItemSpecText(from, session, text)
@@ -6743,7 +6751,7 @@ export async function POST(request: Request) {
         if (session?.step === 'pay_search') {
           if (lower === 'cancel' || lower === 'help') {
             await clearSession(from)
-            await sendWhatsAppMessage(from, await helpText(from))
+            await sendWhatsAppMessage(from, lower === 'cancel' ? CANCEL_TEXT : await helpText(from))
             continue
           }
           await handlePaySearchText(from, session, text)
@@ -6752,7 +6760,7 @@ export async function POST(request: Request) {
         if (session?.step === 'pay_pick') {
           if (lower === 'cancel' || lower === 'help') {
             await clearSession(from)
-            await sendWhatsAppMessage(from, await helpText(from))
+            await sendWhatsAppMessage(from, lower === 'cancel' ? CANCEL_TEXT : await helpText(from))
             continue
           }
           const mPick = lower.match(/^([1-9])$/)
@@ -6769,7 +6777,7 @@ export async function POST(request: Request) {
         if (session?.step === 'pay_plan') {
           if (lower === 'cancel' || lower === 'help') {
             await clearSession(from)
-            await sendWhatsAppMessage(from, await helpText(from))
+            await sendWhatsAppMessage(from, lower === 'cancel' ? CANCEL_TEXT : await helpText(from))
             continue
           }
           const plan = canonicalPlan(text)
@@ -6783,7 +6791,7 @@ export async function POST(request: Request) {
         if (session?.step === 'pay_ecocash') {
           if (lower === 'cancel' || lower === 'help') {
             await clearSession(from)
-            await sendWhatsAppMessage(from, await helpText(from))
+            await sendWhatsAppMessage(from, lower === 'cancel' ? CANCEL_TEXT : await helpText(from))
             continue
           }
           await handleEcoCashText(from, session, text)
@@ -6797,7 +6805,7 @@ export async function POST(request: Request) {
 
         if (session?.step && (lower === 'cancel' || lower === 'help')) {
           await clearSession(from)
-          await sendWhatsAppMessage(from, await helpText(from))
+          await sendWhatsAppMessage(from, lower === 'cancel' ? CANCEL_TEXT : await helpText(from))
           continue
         }
 
