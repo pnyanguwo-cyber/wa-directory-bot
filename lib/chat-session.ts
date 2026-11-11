@@ -182,7 +182,10 @@ export async function saveSession(phone: string, step: string, data: ChatSession
     // flow never silently throws the half-finished one away. An admin hold
     // (`held`) is likewise sticky until an explicit `held: undefined` —
     // normal flow saves must never silently end a takeover.
-    if (!('paused' in data) || !('held' in data)) {
+    // The cart is sticky for the same reason: searching for a second item must
+    // not empty what the buyer already picked. Only an explicit `cart: []`
+    // (checkout, clear) removes it.
+    if (!('paused' in data) || !('held' in data) || !('cart' in data)) {
       const { data: row } = await supabase
         .from('chat_sessions')
         .select('data')
@@ -197,6 +200,10 @@ export async function saveSession(phone: string, step: string, data: ChatSession
       if (!('held' in data)) {
         const held = row?.data?.held as ChatSessionData['held'] | undefined
         if (held) out = { ...out, held }
+      }
+      if (!('cart' in data)) {
+        const cart = row?.data?.cart as ChatSessionData['cart'] | undefined
+        if (Array.isArray(cart) && cart.length > 0) out = { ...out, cart }
       }
     }
     await supabase

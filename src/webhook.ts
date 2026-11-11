@@ -1071,8 +1071,19 @@ function sanitizeLocationInput(raw: string): string {
   return t.replace(/\S+/g, w => w.charAt(0).toUpperCase() + w.slice(1).toLowerCase())
 }
 
-async function startFreshSearchPrompt(from: string) {
+/** Drop the open step but keep the cart — changing what you are shopping for
+ * must never empty what you already picked. */
+async function resetForNewSearch(from: string, session: ChatSession | null) {
+  const cart = session?.data.cart
+  if (cart && cart.length) {
+    await saveSession(from, 'idle', { cart })
+    return
+  }
   await clearSession(from)
+}
+
+async function startFreshSearchPrompt(from: string) {
+  await resetForNewSearch(from, await getSession(from))
   await sendWhatsAppMessage(
     from,
     'Tell me what you need + your town, e.g. *"bread chinhoyi"* or *"plumber harare"*.'
@@ -4358,7 +4369,8 @@ async function handleAction(from: string, session: ChatSession | null, action: s
 
   // Back from the cart's confirm screen to the quantity controls.
   if (action === 'cart_edit') {
-    const data = { ...(session?.data || {}), pendingOrder: undefined }
+    const cur = await loadCartSession(from, session)
+    const data = { ...(cur?.data || {}), pendingOrder: undefined }
     await saveSession(from, 'browse', data)
     await handleViewCart(from, { phone: from, step: 'browse', data })
     return
@@ -4367,12 +4379,14 @@ async function handleAction(from: string, session: ChatSession | null, action: s
   // Change quantity: cart_item_<itemId> opens the item, cart_inc|dec|del_<id>
   const cartItemMatch = action.match(/^cart_item_(.+)$/)
   if (cartItemMatch) {
-    await sendCartItemScreen(from, session?.data || {}, cartItemMatch[1])
+    const cartSession = await loadCartSession(from, session)
+    await sendCartItemScreen(from, cartSession?.data || {}, cartItemMatch[1])
     return
   }
   const cartQtyMatch = action.match(/^cart_(inc|dec|del)_(.+)$/)
   if (cartQtyMatch) {
     const [, op, itemId] = cartQtyMatch
+    session = await loadCartSession(from, session)
     if (!session) {
       await sendWhatsAppMessage(from, 'That cart has expired - add your items again and reply *cart*.')
       return
@@ -5622,9 +5636,10 @@ async function sendResultDetail(
     detailItems: shownItems,
   })
 
-  // One interactive item only: the Chat on WhatsApp button (the old
-  // Back/New-search row is gone — typed replies cover those actions).
-  const msg = renderDetailCard({
+  // One message, not three: the card and its buttons ride together when the
+  // text fits WhatsApp's 1024-char interactive body, and directions live in
+  // the card as a plain link instead of a separate CTA message.
+  let msg = renderDetailCard({
     name: b.name,
     slug: b.slug,
     city: b.city,
@@ -5643,41 +5658,40 @@ async function sendResultDetail(
     website: b.website,
     generateSite: !!b.generate_site || undefined,
   })
-  await sendWhatsAppMessage(from, msg)
-
-  // Native "Chat on WhatsApp" button (cta_url) — plus the 📸 single-photo
-  // pick-list so customers can see one item without the full catalog walk.
-  // Voice-only listings have nothing to chat with, so they skip chat.
-  const digits = (b.phone || '').replace(/[^0-9]/g, '')
-  if (digits && b.phone_type !== 'voice') {
-    await sendInteractiveButtons(from, renderChatPrompt(b.name), [
-      { id: `browse_items_detail_${b.id}`, title: '🧺 Browse all items' },
-      { id: `cta_chat_${b.id}`, title: '💬 Chat on WhatsApp' },
-      { id: `photo_pick_${b.id}`, title: '📸 See a photo' },
-    ])
-  } else {
-    // Fallback: just browsing if no chat
-    await sendInteractiveButtons(from, 'Options', [
-      { id: `browse_items_detail_${b.id}`, title: '🧺 Browse all items' },
-      { id: `photo_pick_${b.id}`, title: '📸 See a photo' },
-    ])
-  }
-
-  // 🧭 Directions — coords give a one-tap Google Maps route, otherwise a
-  // place search from name + area + city. Skipped when there is not enough
-  // to point at anything useful.
+  // 🧭 Directions — a bare link inside the card. Coords give a Google Maps
+  // route; otherwise a place search from name + area + city.
   const hasCoords = b.lat != null && b.lng != null
   const placeBits = [b.name, b.area, b.city, 'Zimbabwe'].filter(Boolean)
   if (hasCoords || (b.name && (b.area || b.city))) {
     const directionsUrl = hasCoords
       ? `https://www.google.com/maps/dir/?api=1&destination=${b.lat},${b.lng}`
       : `https://www.google.com/maps/search/?api=1&query=${encodeURIComponent(placeBits.join(', '))}`
-    await sendCtaUrl(
-      from,
-      `Not sure where *${b.name}* is? One tap opens Google Maps with directions.`,
-      '🧭 Get directions ▸',
-      directionsUrl
-    )
+    msg += `\n\n🧭 *Directions*\n${directionsUrl}`
+  }
+
+  // Buttons: browse, chat and the single-photo pick-list. Voice-only listings
+  // have nothing to chat with, so they skip that one.
+  const digits = (b.phone || '').replace(/[^0-9]/g, '')
+  const buttons: InteractiveButton[] =
+    digits && b.phone_type !== 'voice'
+      ? [
+          { id: `browse_items_detail_${b.id}`, title: '🧺 Browse all items' },
+          { id: `cta_chat_${b.id}`, title: '💬 Chat on WhatsApp' },
+          { id: `photo_pick_${b.id}`, title: '📸 See a photo' },
+        ]
+      : [
+          { id: `browse_items_detail_${b.id}`, title: '🧺 Browse all items' },
+          { id: `photo_pick_${b.id}`, title: '📸 See a photo' },
+        ]
+
+  if (msg.length <= 1024) {
+    // One message: profile + buttons, so the buttons can never drift away
+    // from the shop they belong to.
+    await sendInteractiveButtons(from, msg, buttons)
+  } else {
+    // Long profile (many areas/socials): the text goes alone, buttons follow.
+    await sendWhatsAppMessage(from, msg)
+    await sendInteractiveButtons(from, 'What next?', buttons)
   }
 
   // Selection analytics — 'bot_select' requires migration 023 to be applied;
@@ -5817,6 +5831,7 @@ async function handleCtaChat(from: string, businessId: string) {
 async function handleAddToCart(from: string, session: ChatSession | null, itemId: string, msgId?: string) {
   // A tap can arrive long after the browse session expired; the item id in the
   // button is enough to start the cart, so never drop the tap on a null session.
+  session = await loadCartSession(from, session)
   // Find item details
   const { data: item } = await getSupabase()
     .from('business_items')
@@ -5848,6 +5863,12 @@ async function handleAddToCart(from: string, session: ChatSession | null, itemId
       { id: 'new_search', title: '🔍 Search more' },
     ]
   )
+}
+
+/** Cart handlers can arrive with no in-memory session (a shelved or 'idle'
+ * row reads as none) while the cart itself still lives on that row. */
+async function loadCartSession(from: string, session: ChatSession | null): Promise<ChatSession | null> {
+  return session ?? (await getSession(from))
 }
 
 /** Cart text: numbered lines so the pick-list below can refer to them, with
@@ -5893,6 +5914,7 @@ async function sendCartItemScreen(from: string, data: ChatSessionData, itemId: s
 }
 
 async function handleViewCart(from: string, session: ChatSession | null) {
+  session = await loadCartSession(from, session)
   const summary = getCartSummary(session?.data || {})
   if (!summary.totalItems) {
     await sendWhatsAppMessage(
@@ -5930,6 +5952,7 @@ async function handleViewCart(from: string, session: ChatSession | null) {
 }
 
 async function handleCheckoutCart(from: string, session: ChatSession | null) {
+  session = await loadCartSession(from, session)
   const summary = getCartSummary(session?.data || {})
   if (!summary.totalItems) {
     await sendWhatsAppMessage(
@@ -5982,7 +6005,8 @@ async function handleCheckoutCart(from: string, session: ChatSession | null) {
 }
 
 async function handleClearCart(from: string, session: ChatSession | null) {
-  if (!session) {
+  session = await loadCartSession(from, session)
+  if (!session || !getCartSummary(session.data).totalItems) {
     await sendWhatsAppMessage(from, '🛒 Your cart is already empty.')
     return
   }
@@ -6295,8 +6319,12 @@ async function continueRegistration(from: string, session: ChatSession, text: st
     }
 
     default:
-      await clearSession(from)
-      await sendWhatsAppMessage(from, await helpText(from))
+      // An unknown or stale tap is not a reason to dump the help manual or
+      // wipe the session — just point at the menu.
+      await sendWhatsAppMessage(
+        from,
+        'That option has expired. Send *menu* to see what I can do, or just type what you need.'
+      )
   }
 }
 
@@ -6775,7 +6803,7 @@ export async function POST(request: Request) {
             await typedOrderFromText(from, session, trimmed.replace(/^order\b[,;:]?\s*/i, ''), )
             continue
           }
-          await clearSession(from)
+          await resetForNewSearch(from, session)
           session = null
           await dispatchSearch(from, text)
           continue
@@ -6843,7 +6871,7 @@ export async function POST(request: Request) {
             continue
           }
           // Anything else is a fresh search — drop the list and re-dispatch
-          await clearSession(from)
+          await resetForNewSearch(from, session)
           session = null
           await dispatchSearch(from, text)
           continue
