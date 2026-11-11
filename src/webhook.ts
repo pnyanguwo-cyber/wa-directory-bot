@@ -265,7 +265,7 @@ const CANCEL_TEXT =
 
 // Extra admin numbers live in bot_settings.admin_allowlist (JSON array).
 // The env ADMIN_WHATSAPP number is always the undeletable owner.
-async function adminNumbers(): Promise<string[]> {
+export async function adminNumbers(): Promise<string[]> {
   const root = digitsOnly(ADMIN_WHATSAPP || '')
   const raw = await getBotSetting('admin_allowlist')
   let extras: string[] = []
@@ -2879,7 +2879,7 @@ async function postBuyerNeed(from: string, session: ChatSession | null) {
 }
 
 /** Plain notice to every admin number (deal closed, order stranded, etc). */
-async function notifyAdminsText(body: string) {
+export async function notifyAdminsText(body: string) {
   for (const admin of await adminNumbers()) {
     if (!admin) continue
     await sendWhatsAppText(admin, body)
