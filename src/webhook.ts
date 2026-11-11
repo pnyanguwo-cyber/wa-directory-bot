@@ -1056,7 +1056,7 @@ async function startFreshSearchPrompt(from: string) {
 const MENU_ROWS = [
   { id: 'menu_needs', title: '🛒 Post a need', description: 'Suppliers quote you here' },
   { id: 'menu_order', title: '🧺 Order items', description: 'Type items - sent shop by shop' },
-  { id: 'menu_register', title: '✎ Register', description: 'Business $1/mo · Personal $1/mo' },
+  { id: 'menu_register', title: '✎ Register', description: 'Business $2/mo · Personal $1/mo · 90-day free trial' },
   { id: 'menu_pay', title: '$ Pay (EcoCash)', description: 'Pay or top up via EcoCash' },
   { id: 'menu_help', title: '✆ Help', description: 'Tips & support' },
 ]
@@ -1648,7 +1648,7 @@ async function tryPublishContact(
   const payerZero = payerDigits.replace(/^263/, '0')
 
   // Guard 1 — cap: max 3 ACTIVE personal contacts per payer phone, so a
-  // business can't dodge the USD 1 subscription by batch-buying cheap rows.
+  // business can't dodge the USD 2 rate by batch-buying USD 1 personal rows.
   const { data: payerSubs } = await getSupabase()
     .from('listing_subscriptions')
     .select('business_id, businesses!inner(category)')
@@ -1666,7 +1666,7 @@ async function tryPublishContact(
         'You already have 3 active personal contacts 📱',
         '',
         'That is the limit per person. If you are registering a business,',
-        'tap ✎ Register and choose *Business* - USD 1 per month, no cap.',
+        'tap ✎ Register and choose *Business* - USD 2 per month, no cap.',
       ].join('\n')
     )
     await clearSession(from)
@@ -1695,7 +1695,7 @@ async function tryPublishContact(
         `*+263${listedDigits}* is already registered as a business listing`,
         `(*${bizBlock.name}*) - personal contacts are for people, not companies.`,
         '',
-        'If that is you: renew it for USD 1/month (send *pay*), or register a',
+        'If that is you: renew it for USD 2/month (send *pay*), or register a',
         'different number for the personal contact.',
       ].join('\n')
     )
