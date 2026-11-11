@@ -5577,6 +5577,22 @@ async function supplierRecentlyActive(digits: string): Promise<boolean> {
   }
 }
 
+/** Where the price conversation on a row ended up: the last counter event
+ * wins, so a later counter after a decline shows as pending again. */
+function counterState(row: SupplyOrderRow): 'pending' | 'accepted' | 'declined' | null {
+  const last = [...(row.trace || [])]
+    .reverse()
+    .map(t => String((t as { event?: string }).event || ''))
+    .find(e => e === 'counter' || e === 'counter-accepted' || e === 'counter-declined')
+  if (!last) return null
+  return last === 'counter' ? 'pending' : last === 'counter-accepted' ? 'accepted' : 'declined'
+}
+
+/** Order total from the stored lines (the current, possibly countered, price). */
+function orderTotal(row: SupplyOrderRow): number {
+  return sumLines((row.lines || []) as { qty: number; price: number | null }[])
+}
+
 /** Supplier taps ✅ I can supply: claim the sale and arm the buyer. */
 async function handleClaimTap(from: string, session: ChatSession | null, orderId: number) {
   const row = await getSupplyOrderById(orderId)
@@ -5831,6 +5847,17 @@ async function sendSupplierOrders(from: string, session: ChatSession | null) {
       .join(', ')
     lines.push(`*${r.token}* · ${r.buyer_phone ? '+' + digitsOnly(r.buyer_phone) : ''}`)
     lines.push(`↳ ${summary}`)
+    const bits = [
+      `*${monoUSD(orderTotal(r)).replace(/`/g, '')}*`,
+      (() => {
+        const c = counterState(r)
+        if (c === 'pending') return '💰 your new price: awaiting buyer'
+        if (c === 'accepted') return '💰 new price accepted'
+        if (c === 'declined') return '💰 new price declined - original stands'
+        return ''
+      })(),
+    ].filter(Boolean)
+    if (bits.length) lines.push(`   ↳ ${bits.join(' · ')}`)
     lines.push('')
   }
   await sendWhatsAppMessage(from, lines.join('\n'))
@@ -5851,7 +5878,15 @@ async function sendMyOrders(from: string, session: ChatSession | null) {
   }
   await sendWhatsAppMessage(
     from,
-    renderMyOrders(rows.map(r => ({ biz_name: r.biz_name, status: r.status, token: r.token })))
+    renderMyOrders(
+      rows.map(r => ({
+        biz_name: r.biz_name,
+        status: r.status,
+        token: r.token,
+        total: orderTotal(r),
+        counter: counterState(r),
+      }))
+    )
   )
 }
 
