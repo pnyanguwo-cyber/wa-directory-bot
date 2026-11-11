@@ -4356,6 +4356,38 @@ async function handleAction(from: string, session: ChatSession | null, action: s
     return
   }
 
+  // Change quantity: cart_item_<itemId> opens the item, cart_inc|dec|del_<id>
+  const cartItemMatch = action.match(/^cart_item_(.+)$/)
+  if (cartItemMatch) {
+    await sendCartItemScreen(from, session?.data || {}, cartItemMatch[1])
+    return
+  }
+  const cartQtyMatch = action.match(/^cart_(inc|dec|del)_(.+)$/)
+  if (cartQtyMatch) {
+    const [, op, itemId] = cartQtyMatch
+    if (!session) {
+      await sendWhatsAppMessage(from, 'That cart has expired - add your items again and reply *cart*.')
+      return
+    }
+    const item = getCart(session.data).find(c => c.itemId === itemId)
+    if (!item) {
+      await sendWhatsAppMessage(from, 'That item is no longer in your cart.')
+      return
+    }
+    const data =
+      op === 'del'
+        ? removeFromCart(session.data, item.businessId, itemId)
+        : updateCartQty(session.data, item.businessId, itemId, item.qty + (op === 'inc' ? 1 : -1))
+    await saveSession(from, session.step, data)
+    if (getCart(data).some(c => c.itemId === itemId)) {
+      await sendCartItemScreen(from, data, itemId)
+    } else {
+      await sendWhatsAppMessage(from, `🗑 Removed *${item.itemName}*.`)
+      await handleViewCart(from, { ...session, data })
+    }
+    return
+  }
+
   // Checkout cart (send orders to suppliers)
   if (action === 'checkout_cart') {
     await handleCheckoutCart(from, session)
@@ -5774,6 +5806,48 @@ async function handleAddToCart(from: string, session: ChatSession | null, itemId
   )
 }
 
+/** Cart text: numbered lines so the pick-list below can refer to them, with
+ * quantities and per-shop subtotals. */
+function renderCartBody(summary: ReturnType<typeof getCartSummary>): string {
+  let n = 0
+  const lines = [`🛒 *Your Cart* (${summary.totalItems} item${summary.totalItems === 1 ? '' : 's'})`, '']
+  for (const group of summary.groups) {
+    lines.push(`🏪 *${group.businessName}* - ${monoUSD(group.subtotal).replace(/`/g, '')}`)
+    for (const item of group.items) {
+      n += 1
+      lines.push(`  ${n}. ${item.itemName} ×${item.qty} - ${monoUSD(item.price * item.qty).replace(/`/g, '')}`)
+    }
+    lines.push('')
+  }
+  lines.push(`*Grand Total: ${monoUSD(summary.grandTotal).replace(/`/g, '')}*`)
+  return lines.join('\n')
+}
+
+/** One cart line's quantity screen: ➕ / ➖ / remove, three buttons exactly. */
+async function sendCartItemScreen(from: string, data: ChatSessionData, itemId: string) {
+  const item = getCart(data).find(c => c.itemId === itemId)
+  if (!item) {
+    await sendWhatsAppMessage(from, 'That item is no longer in your cart.')
+    return
+  }
+  await sendInteractiveButtons(
+    from,
+    [
+      `*${item.itemName}*`,
+      `🏪 ${item.businessName}`,
+      '',
+      `Quantity: *${item.qty}* · ${monoUSD(item.price * item.qty).replace(/`/g, '')}`,
+      '',
+      'Tap ➕ or ➖ to change it, or 🛒 *cart* to see the whole cart.',
+    ].join('\n'),
+    [
+      { id: `cart_inc_${item.itemId}`, title: '➕ Add one' },
+      { id: `cart_dec_${item.itemId}`, title: '➖ Remove one' },
+      { id: `cart_del_${item.itemId}`, title: '🗑 Remove' },
+    ]
+  )
+}
+
 async function handleViewCart(from: string, session: ChatSession | null) {
   const summary = getCartSummary(session?.data || {})
   if (!summary.totalItems) {
@@ -5784,17 +5858,27 @@ async function handleViewCart(from: string, session: ChatSession | null) {
     return
   }
 
-  let body = `🛒 *Your Cart* (${summary.totalItems} items)\n\n`
-  for (const group of summary.groups) {
-    body += `🏪 *${group.businessName}* - ${monoUSD(group.subtotal).replace(/`/g, '')}\n`
-    for (const item of group.items) {
-      body += `  • ${item.itemName} ×${item.qty} - ${monoUSD(item.price * item.qty).replace(/`/g, '')}\n`
-    }
-    body += '\n'
-  }
-  body += `*Grand Total: ${monoUSD(summary.grandTotal).replace(/`/g, '')}*`
+  const items = summary.groups.flatMap(g => g.items)
+  const body = renderCartBody(summary)
+  // The pick-list body shares WhatsApp's 1024-char cap with the text above it,
+  // so a big cart gets a compact header and keeps the numbered rows instead.
+  const listBody =
+    body.length <= 900
+      ? `${body}\n\nTap an item to change its quantity.`
+      : `🛒 *Your Cart* (${summary.totalItems} item${summary.totalItems === 1 ? '' : 's'}) · ${monoUSD(summary.grandTotal).replace(/`/g, '')} from ${summary.groups.length} shop${summary.groups.length === 1 ? '' : 's'}\n\nTap an item to change its quantity.`
 
-  await sendInteractiveButtons(from, body, [
+  await sendInteractiveList(
+    from,
+    listBody,
+    items.slice(0, 10).map((item, i) => ({
+      id: `cart_item_${item.itemId}`,
+      title: `${i + 1}. ${item.itemName}`,
+      description: `×${item.qty} · ${monoUSD(item.price * item.qty).replace(/`/g, '')}`,
+    })),
+    'Change quantity'
+  )
+
+  await sendInteractiveButtons(from, 'Ready to order?', [
     { id: 'checkout_cart', title: '✅ Send all orders' },
     { id: 'clear_cart', title: '🗑️ Clear cart' },
     { id: 'new_search', title: '🔍 Search more' },
