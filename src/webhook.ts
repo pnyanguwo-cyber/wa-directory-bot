@@ -1988,6 +1988,23 @@ async function handleBotMedia(
   const mediaId = blob?.id || ''
   const caption = typeof blob?.caption === 'string' ? blob.caption : ''
 
+  const convState = await getConversationState(from)
+  if (convState && convState.state.startsWith('REGISTRATION_') && kind === 'image') {
+    const media = await fetchWhatsAppMedia(mediaId)
+    if (media) {
+      console.log(`[bot-media] registration photo routed to extraction (${from})`)
+      await handleRegistrationImage(from, new Uint8Array(media.buffer), caption)
+    } else {
+      console.warn(`[bot-media] registration photo download failed (${from}, ${mediaId})`)
+      await sendWhatsAppMessage(
+        from,
+        "I couldn't download that picture. Send it again as a photo, or reply *skip* to continue without one.",
+        mediaMsgId
+      )
+    }
+    return
+  }
+
   // Post-activation shelf: a live business owner sending a photo with no flow
   // in progress is most likely stocking their website shop shelf — no AI pass
   // needed, just storage.
@@ -6515,16 +6532,6 @@ export async function POST(request: Request) {
         // ── New registration flow (REGISTRATION_* states from Supabase) ───────
         const convState = await getConversationState(from)
         if (convState && convState.state.startsWith('REGISTRATION_')) {
-          // Handle image messages
-          if (mediaKind === 'image') {
-            const media = await fetchWhatsAppMedia(message.id)
-            if (media) {
-              const imageBytes = new Uint8Array(media.buffer)
-              await handleRegistrationImage(from, imageBytes, '')
-              continue
-            }
-          }
-          // Handle text messages
           await handleRegistrationMessage(from, text, convState.context)
           continue
         }
