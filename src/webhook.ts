@@ -176,6 +176,18 @@ import {
   MAX_AUDIENCE,
   type CastSpec,
 } from '@wa-directory/shared'
+// #1 bidding engine (fair-bidding rules; the webapp's portal API mirrors them).
+import {
+  handleBidCommand,
+  handleBidCategorySelection,
+  handleBidCitySelection,
+  handleBidNationwideSelection,
+  handleBidAmount,
+  handleBidConfirm,
+  handleMyBidsCommand,
+  handleOutbidCommand,
+  parseBidAmountId,
+} from '@wa-directory/shared'
 // S18.5 Supplier Demand Radar — lib/radar.ts helpers (fail-open by design).
 import {
   emitDemandSearch,
@@ -1068,6 +1080,7 @@ const MENU_ROWS = [
   { id: 'menu_order', title: '🧺 Order items', description: 'Type your shopping list — sent shop by shop' },
   { id: 'menu_register', title: '✎ Register', description: 'List your business or contact — $2/mo · 90-day free trial' },
   { id: 'menu_pay', title: '$ Pay (EcoCash)', description: 'Pay or top up your subscription via EcoCash' },
+  { id: 'menu_bid', title: '🏆 Bid for #1', description: 'Own the top search spot for your category' },
   { id: 'menu_help', title: '✆ Help', description: 'Search tips, account help & support' },
 ]
 
@@ -4044,6 +4057,52 @@ async function handleAdminCommand(from: string, text: string): Promise<boolean> 
 }
 
 async function handleAction(from: string, session: ChatSession | null, action: string, msgId?: string) {
+  // ── #1 bidding callbacks (business owners) ───────────────────────────
+  // The amount buttons carry the full scope in the id, so no stored state.
+  if (action.startsWith('bid_cat_')) {
+    await handleBidCategorySelection(from, action)
+    return
+  }
+  if (action.startsWith('bid_city_')) {
+    await handleBidCitySelection(from, action)
+    return
+  }
+  if (action.startsWith('bid_nationwide_')) {
+    await handleBidNationwideSelection(from, action)
+    return
+  }
+  if (action.startsWith('bid_amt_')) {
+    if (action.startsWith('bid_amt_custom')) {
+      // bid_amt_custom__<category>__<city> — the suffix carries the scope.
+      const parts = action.slice('bid_amt_custom'.length).split('__')
+      const category = (parts[1] || '').trim()
+      const city = (parts[2] || '').replace(/_/g, ' ').trim()
+      await sendWhatsAppMessage(
+        from,
+        category
+          ? `Type the amount, then confirm in this format:\n\`confirm <amount> <ecocash-number> ${category}${city ? ` in ${city}` : ' nationwide'}\``
+          : 'Reply with: `confirm <amount> <phone> <category> [in <city> | nationwide]`'
+      )
+      return
+    }
+    const parsed = parseBidAmountId(action)
+    if (!parsed) {
+      await sendWhatsAppMessage(from, 'Reply with: `confirm <amount> <phone> <category> [in <city> | nationwide]`')
+      return
+    }
+    const { data: biz } = await getSupabase()
+      .from('businesses')
+      .select('id')
+      .eq('phone', from)
+      .maybeSingle()
+    if (biz) {
+      await handleBidAmount(from, biz.id, parsed.category, parsed.city, parsed.amount)
+    } else {
+      await sendWhatsAppMessage(from, 'No business found for this WhatsApp number. Register first with *register*.')
+    }
+    return
+  }
+
   // Broadcast confirm/schedule/cancel (admins only). Casting is queued in
   // bot_casts: the first ≤SYNC_MAX_SENDS go out right here, anything larger
   // continues automatically via the hourly cron.
@@ -4341,6 +4400,9 @@ async function handleAction(from: string, session: ChatSession | null, action: s
       return
     case 'menu_order':
       await typedOrderFromText(from, session, 'order')
+      return
+    case 'menu_bid':
+      await handleBidCommand(from, 'bid')
       return
     // ── S19 goal-word ask taps ────────────────────────────────────────
     // The two-way prompt showed "N businesses match \"{word}\" — search
@@ -5828,7 +5890,7 @@ async function publishBusiness(from: string, session: ChatSession, msgId?: strin
         `✏️ Save this link to edit your listing later:`,
         `${SITE_URL}/edit?token=${token}`,
         '',
-        `🔐 Create your portal account (stats, conversations, ranking):`,
+        `🔐 Inside your portal (opens a web page): edit your listing & website, business card + QR code templates, stats, conversations.`,
         `${SITE_URL}/account-setup?token=${token}`,
         '',
         `📱 Your QR codes (chat + portal): print them for customers:`,
@@ -6333,6 +6395,28 @@ export async function POST(request: Request) {
           await sendMyListings(from, false)
           await clearSession(from)
           continue
+        }
+
+        // ── #1 bidding text commands (business owners) ──────────────────
+        // Skipped while a data-entry step is active so flow answers are
+        // never hijacked (e.g. "confirm" mid-order stays flow text).
+        if (!dataEntryLocked) {
+          if (lower === 'bid' || lower.startsWith('bid ')) {
+            await handleBidCommand(from, text)
+            continue
+          }
+          if (lower === 'my bids') {
+            await handleMyBidsCommand(from)
+            continue
+          }
+          if (lower === 'outbid') {
+            await handleOutbidCommand(from)
+            continue
+          }
+          if (lower.startsWith('confirm ')) {
+            await handleBidConfirm(from, text)
+            continue
+          }
         }
 
         // ── Bot search conversation steps ───────────────────────────────
