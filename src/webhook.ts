@@ -179,6 +179,7 @@ import {
 // #1 bidding engine (fair-bidding rules; the webapp's portal API mirrors them).
 import {
   handleBidCommand,
+  handleBidBusinessSelection,
   handleBidCategorySelection,
   handleBidCitySelection,
   handleBidNationwideSelection,
@@ -4059,6 +4060,10 @@ async function handleAdminCommand(from: string, text: string): Promise<boolean> 
 async function handleAction(from: string, session: ChatSession | null, action: string, msgId?: string) {
   // ── #1 bidding callbacks (business owners) ───────────────────────────
   // The amount buttons carry the full scope in the id, so no stored state.
+  if (action.startsWith('bid_biz_')) {
+    await handleBidBusinessSelection(from, action)
+    return
+  }
   if (action.startsWith('bid_cat_')) {
     await handleBidCategorySelection(from, action)
     return
@@ -4075,8 +4080,11 @@ async function handleAction(from: string, session: ChatSession | null, action: s
     if (action.startsWith('bid_amt_custom')) {
       // bid_amt_custom__<category>__<city> — the suffix carries the scope.
       const parts = action.slice('bid_amt_custom'.length).split('__')
-      const category = (parts[1] || '').trim()
-      const city = (parts[2] || '').replace(/_/g, ' ').trim()
+      // New ids carry the listing: __<rowId>__<category>__<city>.
+      // Legacy ids are __<category>__<city>.
+      const offset = parts.length >= 4 ? 1 : 0
+      const category = (parts[1 + offset] || '').trim()
+      const city = (parts[2 + offset] || '').replace(/_/g, ' ').trim()
       await sendWhatsAppMessage(
         from,
         category
@@ -4086,15 +4094,24 @@ async function handleAction(from: string, session: ChatSession | null, action: s
       return
     }
     const parsed = parseBidAmountId(action)
+    // The id carries the listing, so multi-listing owners resolve correctly.
+    if (parsed?.businessId) {
+      await handleBidAmount(from, parsed.businessId, parsed.category, parsed.city, parsed.amount)
+      return
+    }
     if (!parsed) {
       await sendWhatsAppMessage(from, 'Reply with: `confirm <amount> <phone> <category> [in <city> | nationwide]`')
       return
     }
-    const { data: biz } = await getSupabase()
+    // Legacy id without a listing id: fall back to the sender's first listing.
+    // (.maybeSingle() would error when the number owns more than one.)
+    const { data: bizRows } = await getSupabase()
       .from('businesses')
       .select('id')
       .eq('phone', from)
-      .maybeSingle()
+      .order('created_at', { ascending: true })
+      .limit(1)
+    const biz = bizRows?.[0]
     if (biz) {
       await handleBidAmount(from, biz.id, parsed.category, parsed.city, parsed.amount)
     } else {
