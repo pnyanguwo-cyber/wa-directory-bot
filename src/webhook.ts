@@ -5533,9 +5533,18 @@ async function sendResultDetail(
     .order('price', { ascending: true })
     .limit(3)
 
-  // The typed-order flow latches onto the shop the customer is looking at:
-  // a bare `order` line prefers this shelf over the whole directory.
-  await saveSession(from, 'browse', { ...session.data, lastScreen: 'detail', lastBizId: b.id })
+  // Keep the exact products the card printed (same order) so a typed number
+  // can add one to the cart. The typed-order flow also latches onto this shop:
+  // a bare `order` line prefers its shelf over the whole directory.
+  const shownItems = ((itemRows as { id: string; name: string; price: number | null }[] | null) || []).map(
+    i => ({ id: i.id, name: i.name, price: i.price })
+  )
+  await saveSession(from, 'browse', {
+    ...session.data,
+    lastScreen: 'detail',
+    lastBizId: b.id,
+    detailItems: shownItems,
+  })
 
   // One interactive item only: the Chat on WhatsApp button (the old
   // Back/New-search row is gone — typed replies cover those actions).
@@ -5546,7 +5555,7 @@ async function sendResultDetail(
     area: b.area,
     rating: b.rating,
     reviewCount: b.review_count,
-    items: ((itemRows as { name: string; price: number | null }[]) || []).slice(),
+    items: shownItems,
     phone: b.phone,
     phoneType: b.phone_type,
     socials: Array.isArray(b.socials) ? b.socials : [],
@@ -6642,6 +6651,26 @@ export async function POST(request: Request) {
             }
             continue
           }
+          // A shop card is open: a bare number picks that product from the
+          // card's price list and adds it to the cart — the same action as the
+          // 🧺 Add to cart button, without the round trip through the catalog.
+          if (session.data.lastScreen === 'detail') {
+            const picked = lower.match(/^\s*([1-9])\s*$/)
+            const items = session.data.detailItems || []
+            if (picked && items.length) {
+              const item = items[Number(picked[1]) - 1]
+              if (item) {
+                await handleAddToCart(from, session, item.id, msgId)
+              } else {
+                await sendWhatsAppMessage(
+                  from,
+                  `That card lists ${items.length} product${items.length === 1 ? '' : 's'} (1-${items.length}). Tap *🧺 Browse all items* to see the whole shelf.`
+                )
+              }
+              continue
+            }
+          }
+
           const m = text.trim().match(/^([1-9][0-9]?)(?![0-9])/)
           if (m && results.length > 0) {
             const n = Number(m[1])

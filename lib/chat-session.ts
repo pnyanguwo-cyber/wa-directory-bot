@@ -42,6 +42,9 @@ export interface ChatSessionData {
   results?: ResultCard[]
   // What the user is currently looking at, for ⬅ Back routing.
   lastScreen?: 'list' | 'detail'
+  // The products printed on the open shop card, in the same order, so a bare
+  // number can add that product to the cart instead of re-opening the card.
+  detailItems?: { id: string; name: string; price: number | null }[]
   // Where the search originated, so Back can restore the previous prompt.
   origin?: 'search_loc' | 'search_term' | 'free'
   // Search label of the current results, for Back re-rendering.
