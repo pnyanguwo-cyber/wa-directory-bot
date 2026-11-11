@@ -3922,7 +3922,7 @@ async function handleAdminCommand(from: string, text: string): Promise<boolean> 
     })
     lines.push(
       '',
-      'Reply *verify 1* to approve 30 days, *verify 1 90* for custom days, or *unverify 1*.',
+      'Reply *1* to approve 30 days, *verify 1 90* for custom days, or *unverify 1*.',
       'Or skip the list: *verify Diamond tradings 30* matches by name (typo-friendly).'
     )
     await sendWhatsAppMessage(from, lines.join('\n'))
@@ -3988,15 +3988,18 @@ async function handleAdminCommand(from: string, text: string): Promise<boolean> 
         )
         return true
       }
-      // One strong match acts immediately; anything fuzzier shows options.
-      const clear = matches.length === 1 && bestNameSimilarity(rest, matches[0].name) >= 0.82
+      // An exact name (any capitalisation) acts immediately - asking "which
+      // one?" for a name the admin typed in full reads as a refusal. Otherwise
+      // one strong match acts, and anything fuzzier shows options.
+      const exact = matches.find(b => bestNameSimilarity(rest, b.name) === 1) || null
+      const clear = !!exact || (matches.length === 1 && bestNameSimilarity(rest, matches[0].name) >= 0.82)
       if (!clear) {
         await saveSession(from, 'admin_pending', {
           pendingBiz: matches.map(b => b.id),
           pendingOp: op,
           ...(days ? { pendingDays: days } : {}),
         } as ChatSessionData)
-        const lines = [`🤔 Closest matches to *${rest}* - reply *${op} 1* to pick:`, '']
+        const lines = [`🤔 Closest matches to *${rest}* - reply *1* to pick (or *${op} 1*):`, '']
         matches.forEach((b, i) => {
           lines.push(
             `${i + 1}. *${b.name}*${b.city ? ` · ${b.city}` : ''} · ${b.verified ? 'verified' : 'unverified'}`
@@ -4005,7 +4008,7 @@ async function handleAdminCommand(from: string, text: string): Promise<boolean> 
         await sendWhatsAppMessage(from, lines.join('\n'))
         return true
       }
-      biz = matches[0]
+      biz = exact || matches[0]
     }
 
     if (!biz) {
@@ -6777,6 +6780,16 @@ export async function POST(request: Request) {
         if (await isBotAdmin(from)) {
           if (await handleAdminCommand(from, text)) {
             continue
+          }
+          // A pending/verify list was the last thing on screen, so a bare
+          // number is the pick the list asked for - not a stray message for
+          // the generic handler to answer with "that option has expired".
+          const adminPick = text.trim().match(/^([1-9][0-9]?)$/)
+          if (session?.step === 'admin_pending' && adminPick) {
+            const op = session.data.pendingOp === 'unverify' ? 'unverify' : 'verify'
+            if (await handleAdminCommand(from, `${op} ${adminPick[1]}`)) {
+              continue
+            }
           }
           // Admins fall through: their phone works as a normal user too.
         }
