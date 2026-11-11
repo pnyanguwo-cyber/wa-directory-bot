@@ -45,6 +45,9 @@ export interface ChatSessionData {
   // The products printed on the open shop card, in the same order, so a bare
   // number can add that product to the cart instead of re-opening the card.
   detailItems?: { id: string; name: string; price: number | null }[]
+  // Supplier is typing an optional note for a buyer on a confirmed order.
+  order_note_id?: number
+  order_note_token?: string
   // Where the search originated, so Back can restore the previous prompt.
   origin?: 'search_loc' | 'search_term' | 'free'
   // Search label of the current results, for Back re-rendering.

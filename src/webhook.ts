@@ -2877,6 +2877,15 @@ async function postBuyerNeed(from: string, session: ChatSession | null) {
   await clearSession(from)
 }
 
+/** Plain notice to every admin number (deal closed, order stranded, etc). */
+async function notifyAdminsText(body: string) {
+  for (const admin of await adminNumbers()) {
+    if (!admin) continue
+    await sendWhatsAppText(admin, body)
+    logOut(admin, 'text', body)
+  }
+}
+
 async function pingAdminsSearch(term: string, city: string | null, from: string) {
   const adminBody = [
     `🔎 *Buyer searching*`,
@@ -3097,6 +3106,34 @@ async function pickQuoteForBuyer(buyerPhone: string, quoteId: number) {
     ].join('\n')
   )
   await sendContactCard(quote.supplier_phone, 'Buyer', need.buyer_phone)
+
+  // Everyone else who quoted stops chasing: this need is settled.
+  const others = quotes
+    .filter(q => q.id !== quote.id && q.supplier_phone)
+    .slice(0, 5)
+  for (const q of others) {
+    await sendWhatsAppMessage(
+      q.supplier_phone,
+      [
+        `✅ *${need.rq_id}* has been settled - the buyer chose another offer.`,
+        'Nothing more to do on this one, thanks for quoting.',
+        'Send *claim* for the next lead, or *menu* to post your own shelf.',
+      ].join('\n')
+    )
+  }
+
+  // Admins see the closed deal (and who won) so they never chase it either.
+  await notifyAdminsText(
+    [
+      '🤝 *Deal closed*',
+      `• ${need.rq_id}${[need.qty, need.item].filter(Boolean).length ? ` · ${[need.qty, need.item].filter(Boolean).join(' ')}` : ''}${need.city ? ` · ${need.city}` : ''}`,
+      `• Buyer: +${digitsOnly(need.buyer_phone)}`,
+      `• Chosen: ${quote.supplier_name || 'supplier'}${quote.price ? ` · ${quote.price}` : ''} (+${digitsOnly(quote.supplier_phone)})`,
+      others.length ? `• Told ${others.length} other quote${others.length === 1 ? '' : 's'} it is settled.` : '',
+    ]
+      .filter(Boolean)
+      .join('\n')
+  )
 }
 
 /** Any "RQ-…" text: quote capture, buyer stop/reopen, closed-need notices.
@@ -4218,6 +4255,11 @@ async function handleAction(from: string, session: ChatSession | null, action: s
     await commitPendingOrder(from, session)
     return
   }
+  if (action === 'note_skip') {
+    await resetForNewSearch(from, session)
+    await sendWhatsAppMessage(from, '👍 No note sent - the buyer already has your number.')
+    return
+  }
   if (action === 'oedit') {
     await saveSession(from, 'order', { ...session?.data, pendingOrder: undefined })
     await sendWhatsAppMessage(
@@ -5325,6 +5367,7 @@ async function commitPendingOrder(from: string, session: ChatSession | null) {
     await sendWhatsAppMessage(from, '⚠️ Could not file the order - try again in a minute.')
     return
   }
+  const stranded: SupplyOrderRow[] = []
   for (const row of rows) {
     const ok = await pushOrderToSupplier(row, from)
     if (ok != null) {
@@ -5333,6 +5376,20 @@ async function commitPendingOrder(from: string, session: ChatSession | null) {
         .update({ pushed_via: ok ? 'dm' : 'silent' })
         .eq('id', row.id)
     }
+    // false = the shop has WhatsApp but has not messaged the bot in 24h, so
+    // Meta will not let us open a conversation. The order is filed and the
+    // buyer gets a send-now link; admins get told so it is not forgotten.
+    if (ok === false) stranded.push(row)
+  }
+  if (stranded.length) {
+    await notifyAdminsText(
+      [
+        '⏳ *Order not auto-sent*',
+        ...stranded.map(r => `• ${r.biz_name} · wa.directory/go/o/${r.token}`),
+        `👤 Buyer: +${digitsOnly(from)}`,
+        'Shop has not messaged in 24h. The buyer has a one-tap send link; the shop sees it under *orders* next time they chat.',
+      ].join('\n')
+    )
   }
   await saveSession(from, 'browse', {
     ...session.data,
@@ -5521,8 +5578,56 @@ async function handleClaimTap(from: string, session: ChatSession | null, orderId
       )}`
     )
   }
-  await sendWhatsAppMessage(from, `✅ Noted - your buyer has been pinged with this chat.`)
-  void session
+  // Optional message for the buyer: a price adjustment, a pickup note, anything.
+  await saveSession(from, 'order_note', {
+    ...(session?.data || {}),
+    order_note_id: row.id,
+    order_note_token: row.token,
+  })
+  await sendInteractiveButtons(
+    from,
+    '✅ Noted — your buyer has your number.\n\nWant to add a message for them? A price adjustment, pickup note, anything. Reply with it now, or skip.',
+    [{ id: 'note_skip', title: '⏭ Skip' }]
+  )
+}
+
+/** Relay a supplier's note (often a new price) to the buyer of a confirmed
+ * order, and keep a copy on the order so admins can see what was said. */
+async function relayOrderNote(from: string, session: ChatSession, text: string) {
+  const orderId = Number(session.data.order_note_id)
+  const order = Number.isFinite(orderId) && orderId > 0 ? await getSupplyOrderById(orderId) : null
+  if (!order) {
+    await resetForNewSearch(from, session)
+    await sendWhatsAppMessage(from, 'That order is no longer open - send *orders* to see the current ones.')
+    return
+  }
+  const note = text.trim().slice(0, 600)
+  if (!note) return
+  const buyer = digitsOnly(order.buyer_phone)
+  if (buyer) {
+    await sendWhatsAppMessage(
+      buyer,
+      [
+        `💬 *${order.biz_name}* added a note to your order`,
+        `🧾 wa.directory/go/o/${order.token}`,
+        '',
+        note,
+      ].join('\n')
+    )
+  }
+  // Keep the note with the order (best effort) for the admin view.
+  try {
+    const existing = (order as { note?: string | null }).note || ''
+    await getSupabase()
+      .from('supply_orders')
+      .update({ note: [existing, note].filter(Boolean).join('\n') })
+      .eq('id', order.id)
+  } catch {}
+  await resetForNewSearch(from, session)
+  await sendWhatsAppMessage(
+    from,
+    buyer ? '📤 Sent - the buyer has your note.' : 'Saved, but this order has no buyer number to message.'
+  )
 }
 
 /** Typed `orders` for the shops: open slices waiting on them. */
@@ -6466,6 +6571,20 @@ export async function POST(request: Request) {
             continue
           }
           // Admins fall through: their phone works as a normal user too.
+        }
+
+        // ── Supplier's optional note on a just-confirmed order ──────────
+        // Read before any pivot/search routing so "can do $4 each" is a note,
+        // not a search.
+        if (session?.step === 'order_note') {
+          if (!text) continue
+          if (/^(?:skip|no|none|cancel|n\/?a)$/i.test(lower.trim())) {
+            await resetForNewSearch(from, session)
+            await sendWhatsAppMessage(from, '👍 No note sent - the buyer already has your number.')
+            continue
+          }
+          await relayOrderNote(from, session, text)
+          continue
         }
 
         // ── Human takeover gate ─────────────────────────────────────────
