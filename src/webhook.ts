@@ -98,7 +98,8 @@ import { curatedRelatedTerms } from '@wa-directory/shared'
 import { slugify } from '@wa-directory/shared'
 import { zimbabweCities } from '@wa-directory/shared'
 import { validatePhone } from '@wa-directory/shared'
-import { getApprovedCategories, getApprovedAreas, matchCategoryAgainst, matchCategoryLearned, findCityLearned, findAreaLearned } from '@wa-directory/shared'
+import { getApprovedCategories, getApprovedAreas, getApprovedAreaNames, matchCategoryAgainst, matchCategoryLearned, findCityLearned, findAreaLearned } from '@wa-directory/shared'
+import { autoRequestUnapprovedFeatures, adminRequestNotice } from '@wa-directory/shared'
 import { searchPayBusinesses, type PayBusiness } from '@wa-directory/shared'
 import { createListingPayment, paymentAmountFor } from '@wa-directory/shared'
 import { normalizeEcoCashPhone, initiateEcoCashPayment, logPaymentEvent, type PaymentAdapters } from '@wa-directory/shared'
@@ -1042,6 +1043,15 @@ async function findRelatedBusinesses(
 // with the session preserved, so a stale or forged payload cannot trap
 // users in a dead end.
 
+/** User-typed city/area names: strip WhatsApp markers, collapse spaces, cap
+ * length, and title-case (leaving all-caps input like "CBD" alone). */
+function sanitizeLocationInput(raw: string): string {
+  const t = raw.replace(/[`*_~]/g, ' ').replace(/\s+/g, ' ').trim().slice(0, 60)
+  if (!t) return ''
+  if (t === t.toUpperCase() && t.length > 3) return t
+  return t.replace(/\S+/g, w => w.charAt(0).toUpperCase() + w.slice(1).toLowerCase())
+}
+
 async function startFreshSearchPrompt(from: string) {
   await clearSession(from)
   await sendWhatsAppMessage(
@@ -1051,14 +1061,14 @@ async function startFreshSearchPrompt(from: string) {
 }
 
 // Main menu: search is NOT a menu row — typing is searching, so the menu
-// only carries account features. Titles cap at 24 chars (WhatsApp limit);
-// the pricing hook lives in the row description.
+// only carries account features. Titles cap at 24 chars, descriptions at 72
+// (WhatsApp limits); each row explains what it does.
 const MENU_ROWS = [
-  { id: 'menu_needs', title: '🛒 Post a need', description: 'Suppliers quote you here' },
-  { id: 'menu_order', title: '🧺 Order items', description: 'Type items - sent shop by shop' },
-  { id: 'menu_register', title: '✎ Register', description: 'Business $2/mo · Personal $1/mo · 90-day free trial' },
-  { id: 'menu_pay', title: '$ Pay (EcoCash)', description: 'Pay or top up via EcoCash' },
-  { id: 'menu_help', title: '✆ Help', description: 'Tips & support' },
+  { id: 'menu_needs', title: '🛒 Post a need', description: 'Write what you need — suppliers find you' },
+  { id: 'menu_order', title: '🧺 Order items', description: 'Type your shopping list — sent shop by shop' },
+  { id: 'menu_register', title: '✎ Register', description: 'List your business or contact — $2/mo · 90-day free trial' },
+  { id: 'menu_pay', title: '$ Pay (EcoCash)', description: 'Pay or top up your subscription via EcoCash' },
+  { id: 'menu_help', title: '✆ Help', description: 'Search tips, account help & support' },
 ]
 
 async function sendMainMenu(from: string) {
@@ -1448,7 +1458,7 @@ async function resumePaused(from: string, session: ChatSession | null): Promise<
     case 'area':
       await sendWhatsAppMessage(
         from,
-        `${head} Which area in *${data.city || 'your town'}*? (or type *skip*)`
+        `${head} Which area of *${data.city || 'your town'}* is your business in? (We'll use this for your location and the area you serve — your street address is asked separately. Type *skip* if unsure.)`
       )
       return true
     case 'search_loc':
@@ -5767,33 +5777,25 @@ async function publishBusiness(from: string, session: ChatSession, msgId?: strin
   const token = result.editToken
   const slug = result.slug
 
-  // Auto-request unapproved category / area so admins can review them
+  // Auto-request unapproved category / city / area so admins can review them
+  // (same mechanism as the web form's feature requests; a verified business
+  // auto-approves its pending location requests).
   if (businessId) {
     const { data: bizRow } = await getSupabase()
       .from('businesses')
-      .select('category, city, location, phone')
+      .select('name, business_id, category, city, location, phone')
       .eq('id', businessId)
       .maybeSingle()
-    const approvedCats = await getApprovedCategories()
     const cats = Array.isArray(bizRow?.category) ? (bizRow!.category as string[]) : []
-    for (const category of cats) {
-      if (!approvedCats.some(c => c.name === category)) {
-        try {
-          await getSupabase().from('feature_requests').insert({
-            type: 'category', name: category, city: '', business_id: businessId, status: 'pending',
-          })
-        } catch {}
-      }
-    }
-    const approvedAreas = await getApprovedAreas()
-    if (city && area) {
-      const approvedAreaNames = new Set(approvedAreas.filter(a => a.city === city).map(a => a.name))
-      if (!approvedAreaNames.has(area)) {
-        try {
-          await getSupabase().from('feature_requests').insert({
-            type: 'area', name: area, city, business_id: businessId, status: 'pending',
-          })
-        } catch {}
+    const newRequests = await autoRequestUnapprovedFeatures(businessId, {
+      categories: cats,
+      city: city || '',
+      areas: area ? [area] : [],
+    })
+    if (newRequests.length && process.env.ADMIN_WHATSAPP) {
+      const notice = adminRequestNotice(bizRow?.name || '', bizRow?.business_id || '', newRequests)
+      if (notice) {
+        await sendWhatsAppMessage(process.env.ADMIN_WHATSAPP, notice).catch(() => {})
       }
     }
   }
@@ -5952,14 +5954,29 @@ async function continueRegistration(from: string, session: ChatSession, text: st
       }
       const city = await findCityLearned(t)
       if (!city) {
-        const cities = zimbabweCities.slice(0, 8).map(c => c.name).join(', ')
-        await sendWhatsAppMessage(from, `I couldn't find that town. Pick one:\n\n${cities}...\n\nOr type *whole country*`)
+        // Unknown town: accept it (it goes to admin for review) instead of
+        // looping the user. createListing keeps it as a pending city.
+        const newCity = sanitizeLocationInput(t)
+        if (!newCity) {
+          const cities = zimbabweCities.slice(0, 8).map(c => c.name).join(', ')
+          await sendWhatsAppMessage(from, `I couldn't find that town. Pick one:\n\n${cities}...\n\nOr type *whole country*`)
+          break
+        }
+        const merged: ChatSessionData = { ...data, city: newCity, area: '' }
+        await saveSession(from, 'area', merged)
+        await sendWhatsAppMessage(
+          from,
+          `🆕 You're the first business we've seen in *${newCity}* — we'll send it to our admin to verify. Once approved, other businesses there can be listed too.\n\nWhich area of *${newCity}* is your business in? (or type *skip*)`
+        )
         break
       }
       const cityObj = zimbabweCities.find(c => c.name === city)
       if (cityObj && cityObj.areas.length > 0) {
         await saveSession(from, 'area', { ...data, city })
-        const areas = cityObj.areas.slice(0, 12).join(', ')
+        // Admin-approved DB areas for this city join the static dataset.
+        const dbAreas = Array.from(await getApprovedAreaNames(city))
+        const allAreas = Array.from(new Set([...cityObj.areas, ...dbAreas]))
+        const areas = allAreas.slice(0, 12).join(', ')
         await sendWhatsAppMessage(
           from,
           `*${city}*: which area?\n\n${areas}...\n\nOr type *skip* for the whole city.`
@@ -5982,7 +5999,19 @@ async function continueRegistration(from: string, session: ChatSession, text: st
       }
       const area = await findAreaLearned(city, t)
       if (!area) {
-        await sendWhatsAppMessage(from, `I couldn't match that area in *${city}*. Type one of the areas listed, or *skip*.`)
+        // Unknown area: accept it (admin review) instead of looping.
+        const newArea = sanitizeLocationInput(t)
+        if (!newArea) {
+          await sendWhatsAppMessage(from, `I couldn't match that area in *${city}*. Type one of the areas listed, or *skip*.`)
+          break
+        }
+        const merged: ChatSessionData = { ...data, area: newArea }
+        await saveSession(from, 'confirm', merged)
+        await sendWhatsAppMessage(
+          from,
+          `🆕 You're the first business we've seen in *${newArea}, ${city}* — we'll send it to our admin to verify. Once approved, other businesses there can be listed too.`
+        )
+        await sendConfirmation(from, merged)
         break
       }
       const merged: ChatSessionData = { ...data, area }
@@ -6183,9 +6212,8 @@ export async function POST(request: Request) {
           }
           const body = wasKnown
             ? renderWelcomeBack(greetName)
-            : renderFirstWelcome(await channelLinkRaw())
-          await sendWhatsAppMessage(from, body)
-          await sendInteractiveList(from, 'Need something else? Choose 👇', MENU_ROWS, 'Main menu')
+            : renderFirstWelcome(greetName, await channelLinkRaw())
+          await sendInteractiveList(from, body, MENU_ROWS, 'Main menu')
           continue
         }
 
