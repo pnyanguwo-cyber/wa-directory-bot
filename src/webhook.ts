@@ -1358,7 +1358,7 @@ async function handleIntentPivot(
           from,
           'No problem - plans have changed 👍\n\nYou left a registration part-way through. Continue it, or start over?'
         )
-        await sendInteractiveButtons(from, '', [
+        await sendInteractiveButtons(from, 'Continue that draft, or start again?', [
           { id: 'resume_paused', title: '▶ Continue my draft' },
           { id: 'reg_restart', title: '✎ Start over' },
           { id: 'cancel', title: '✖ Cancel' },
@@ -1515,7 +1515,7 @@ async function resumePaused(from: string, session: ChatSession | null): Promise<
             '\n'
           )
         )
-        await sendInteractiveButtons(from, '', [
+        await sendInteractiveButtons(from, 'Send this order, or type it again?', [
           { id: 'osend', title: '✅ Send order' },
           { id: 'oedit', title: '✎ Re-type' },
         ])
@@ -5229,7 +5229,7 @@ async function renderPendingVerify(
         ].join('\n')
       : ''
   await sendWhatsAppMessage(from, `${renderOrderVerify(pendingOrder.groups)}\n${note}`)
-  await sendInteractiveButtons(from, '', [
+  await sendInteractiveButtons(from, 'Does that look right? Send it, or re-type it.', [
     { id: 'osend', title: '✅ Send order' },
     { id: 'oedit', title: '✎ Re-type' },
   ])
@@ -5720,7 +5720,10 @@ async function handleCtaChat(from: string, businessId: string) {
 }
 
 async function handleAddToCart(from: string, session: ChatSession | null, itemId: string, msgId?: string) {
-  if (!session) return
+  if (!session) {
+    await sendWhatsAppMessage(from, 'That item link has expired - search the shop again and tap *Add to cart*.')
+    return
+  }
   // Find item details
   const { data: item } = await getSupabase()
     .from('business_items')
@@ -5755,10 +5758,12 @@ async function handleAddToCart(from: string, session: ChatSession | null, itemId
 }
 
 async function handleViewCart(from: string, session: ChatSession | null) {
-  if (!session) return
-  const summary = getCartSummary(session.data)
-  if (summary.totalItems === 0) {
-    await sendWhatsAppMessage(from, '🛒 Your cart is empty.')
+  const summary = getCartSummary(session?.data || {})
+  if (!summary.totalItems) {
+    await sendWhatsAppMessage(
+      from,
+      '🛒 Your cart is empty.\nSearch for a shop, open an item and tap *Add to cart* - or send *menu*.'
+    )
     return
   }
 
@@ -5780,8 +5785,14 @@ async function handleViewCart(from: string, session: ChatSession | null) {
 }
 
 async function handleCheckoutCart(from: string, session: ChatSession | null) {
-  if (!session) return
-  const summary = getCartSummary(session.data)
+  const summary = getCartSummary(session?.data || {})
+  if (!summary.totalItems) {
+    await sendWhatsAppMessage(
+      from,
+      '🛒 Nothing to send yet - add an item first, then reply *checkout*.'
+    )
+    return
+  }
 
   // For each business group, create supply orders (or link existing ones)
   for (const group of summary.groups) {
@@ -5803,7 +5814,10 @@ async function handleCheckoutCart(from: string, session: ChatSession | null) {
 }
 
 async function handleClearCart(from: string, session: ChatSession | null) {
-  if (!session) return
+  if (!session) {
+    await sendWhatsAppMessage(from, '🛒 Your cart is already empty.')
+    return
+  }
   const data = clearCart(session.data)
   await saveSession(from, session.step, data)
   await sendWhatsAppMessage(from, '🛒 Cart cleared.')
@@ -6436,6 +6450,32 @@ export async function POST(request: Request) {
           }
         }
 
+        // ── 🛒 Cart typed commands ──────────────────────────────────────
+        // Button ids (view_cart, checkout_cart, clear_cart) only fire on a
+        // tap. Typed words must reach the same handlers, or "Check cart"
+        // falls through to search and the person gets a town prompt.
+        const cartText = lower.replace(/[!.?]+$/, '').trim()
+        if (!dataEntryLocked && cartText) {
+          if (
+            /^(?:(?:check|view|open|show|see|display)\s+)?(?:my\s+|the\s+)?(?:shopping\s+)?cart$/.test(cartText) ||
+            /^what(?:'s| is|s)?\s+in\s+(?:my\s+|the\s+)?cart$/.test(cartText)
+          ) {
+            await handleViewCart(from, session)
+            continue
+          }
+          if (/^(?:clear|empty|reset)\s+(?:my\s+|the\s+)?cart$/.test(cartText)) {
+            await handleClearCart(from, session)
+            continue
+          }
+          if (
+            /^(?:check\s?out|checkout\s+(?:my\s+|the\s+)?cart)$/.test(cartText) ||
+            /^send\s+(?:all\s+)?(?:my\s+)?orders?$/.test(cartText)
+          ) {
+            await handleCheckoutCart(from, session)
+            continue
+          }
+        }
+
         // ── Bot search conversation steps ───────────────────────────────
         if (session?.step === 'search_loc') {
           // Waiting for the user's town (term already captured)
@@ -6546,7 +6586,9 @@ export async function POST(request: Request) {
               from,
               'Say it again and I will type along - e.g. *order 2 bread, 1 cake*.'
             )
-            await sendInteractiveButtons(from, '', [{ id: 'osend', title: '✅ Send as-is' }])
+            await sendInteractiveButtons(from, 'Type the new line, or send the order as it stands.', [
+              { id: 'osend', title: '✅ Send as-is' },
+            ])
             continue
           }
           // A fresh order line re-types ("order …" or leading quantity);
