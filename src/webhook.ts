@@ -4541,6 +4541,7 @@ async function handleAction(from: string, session: ChatSession | null, action: s
     case 'reg_upload':
     case 'reg_skip':
     case 'reg_proceed':
+    case 'reg_publish':
     case 'reg_edit': {
       const convState = await getConversationState(from)
       if (convState && convState.state.startsWith('REGISTRATION_')) {
