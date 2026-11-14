@@ -8,6 +8,7 @@ import {
   sendLocationRequest as sendLocationRequestRaw,
   sendReaction as sendReactionRaw,
   sendWhatsAppDocument as sendWhatsAppDocumentRaw,
+  sendWhatsAppImage,
   sendImageWithFallback,
   sendContactCard,
   markRead,
@@ -67,7 +68,7 @@ import {
   type GoalAskKind,
 } from '../lib/intent-pivot.js'
 import {
-  createSupplyOrder, recordOrderOpen, claimSupplyOrder, getSupplyOrderById, listOrdersForBusiness,
+  createSupplyOrder, recordOrderOpen, getOrderByToken, getSupplyOrderById, listOrdersForBusiness,
   listOrdersForBuyer, orderStats, type SupplyOrderRow, type SupplyOrderLine,
 } from '@wa-directory/shared'
 import { getSupabase } from '@wa-directory/shared'
@@ -2024,6 +2025,102 @@ async function handleItemSpecText(from: string, session: ChatSession, text: stri
   await sendWhatsAppMessage(from, response)
 }
 
+// A photo sent while the order verify screen is up is part of the order, not a
+// search. Store it on the pending order and repeat the send button.
+async function attachOrderPhoto(
+  from: string,
+  session: ChatSession,
+  mediaId: string,
+  mediaMsgId: string
+) {
+  const pending = session.data.pendingOrder
+  if (!pending?.groups?.length) return
+  const photos = [...(pending.photos || [])]
+  if (photos.length >= 3) {
+    await sendWhatsAppMessage(from, '📸 That is all 3 photos for this order. Tap ✅ Send order when ready.', mediaMsgId)
+    return
+  }
+  if (!mediaRateOk(from)) {
+    await sendWhatsAppMessage(
+      from,
+      'You can send at most 3 photos per hour. Tap ✅ Send order to continue.',
+      mediaMsgId
+    )
+    return
+  }
+  void markRead(mediaMsgId, true).catch(() => {})
+  const media = await fetchWhatsAppMedia(mediaId)
+  const url = media ? await uploadLogoImage(new Uint8Array(media.buffer)) : null
+  if (!url) {
+    await sendWhatsAppMessage(
+      from,
+      "I couldn't save that photo. Send a JPG or PNG under 2MB, or tap ✅ Send order without it.",
+      mediaMsgId
+    )
+    return
+  }
+  photos.push(url)
+  await saveSession(from, 'order', { ...session.data, pendingOrder: { ...pending, photos } })
+  await sendWhatsAppMessage(
+    from,
+    `📸 Photo attached (${photos.length}/3). Send another, or tap ✅ Send order.`,
+    mediaMsgId
+  )
+  await sendInteractiveButtons(from, 'Ready when you are.', [
+    { id: 'osend', title: '✅ Send order' },
+    { id: 'oedit', title: '✎ Re-type' },
+  ])
+}
+
+// The buyer's photo in answer to a shop's "Ask for photo" request.
+async function handleOrderPhotoReply(
+  from: string,
+  session: ChatSession,
+  mediaId: string,
+  mediaMsgId: string,
+  orderId: number,
+  caption: string
+) {
+  const row = await getSupplyOrderById(orderId)
+  if (!row || row.status === 'closed' || digitsOnly(row.buyer_phone) !== digitsOnly(from)) {
+    await saveSession(from, session.step, { ...session.data, order_photo_request_id: undefined })
+    await sendWhatsAppMessage(from, 'That photo request has expired. Send *menu* to keep going.', mediaMsgId)
+    return
+  }
+  if (!mediaRateOk(from)) {
+    await sendWhatsAppMessage(from, 'You can send at most 3 photos per hour. Try again a little later.', mediaMsgId)
+    return
+  }
+  void markRead(mediaMsgId, true).catch(() => {})
+  const media = await fetchWhatsAppMedia(mediaId)
+  const url = media ? await uploadLogoImage(new Uint8Array(media.buffer)) : null
+  if (!url) {
+    await sendWhatsAppMessage(from, "I couldn't save that photo. Send a JPG or PNG under 2MB.", mediaMsgId)
+    return
+  }
+  const shop = await businessWhatsAppDigits(row.biz_id)
+  const sent = shop
+    ? await sendWhatsAppImage(
+        shop,
+        url,
+        caption
+          ? `📸 ${caption.slice(0, 300)}\nOrder: ${row.token}`
+          : `📸 Product photo for order *${row.token}* from the buyer.`
+      )
+    : false
+  if (!sent) {
+    await sendWhatsAppMessage(
+      from,
+      "I couldn't pass that photo to the shop right now. Try sending it again in a moment.",
+      mediaMsgId
+    )
+    return
+  }
+  await bumpOrderTrace(row.id, { event: 'photo-sent', at: new Date().toISOString() })
+  await saveSession(from, session.step, { ...session.data, order_photo_request_id: undefined })
+  await sendWhatsAppMessage(from, `✅ Photo sent to *${row.biz_name}*.`, mediaMsgId)
+}
+
 async function handleBotMedia(
   from: string,
   session: ChatSession | null,
@@ -2034,6 +2131,19 @@ async function handleBotMedia(
   const blob = message[kind] as { id?: string; caption?: string } | undefined
   const mediaId = blob?.id || ''
   const caption = typeof blob?.caption === 'string' ? blob.caption : ''
+
+  // A supplier asked for a product photo: the next photo from this buyer goes
+  // straight back to that shop, not into search.
+  const photoRequestId = Number(session?.data.order_photo_request_id)
+  if (kind === 'image' && Number.isFinite(photoRequestId) && photoRequestId > 0) {
+    await handleOrderPhotoReply(from, session!, mediaId, mediaMsgId, photoRequestId, caption)
+    return
+  }
+
+  if (kind === 'image' && session?.step === 'order' && session.data.pendingOrder?.groups?.length) {
+    await attachOrderPhoto(from, session, mediaId, mediaMsgId)
+    return
+  }
 
   const convState = await getConversationState(from)
   if (convState && convState.state.startsWith('REGISTRATION_') && kind === 'image') {
@@ -3408,7 +3518,8 @@ async function handleAdminCommand(from: string, text: string): Promise<boolean> 
       for (const n of needs) {
         lines.push(
           `${n.rq_id} · ${[n.qty, n.item].filter(Boolean).join(' ')} · ${(n.city || 'countrywide').toUpperCase()}` +
-          (n.budget ? ` · ${n.budget}` : '') + ` · ${n.status} · ${n.quotes_forwarded || 0}q`
+          (n.budget ? ` · ${n.budget}` : '') +
+          ` · ${n.status} · ${n.quotes_forwarded || 0}q · 👤 +${digitsOnly(n.buyer_phone)}`
         )
       }
       const openCount = needs.filter(n => n.status === 'open').length
@@ -3425,7 +3536,10 @@ async function handleAdminCommand(from: string, text: string): Promise<boolean> 
     }
     const lines = ['🛒 *Open needs*', '']
     for (const n of needs) {
-      lines.push(`${n.rq_id} · ${[n.qty, n.item].filter(Boolean).join(' ')} · ${(n.city || 'countrywide').toUpperCase()} · ${n.quotes_forwarded || 0} quote${n.quotes_forwarded === 1 ? '' : 's'}`)
+      lines.push(
+        `${n.rq_id} · ${[n.qty, n.item].filter(Boolean).join(' ')} · ${(n.city || 'countrywide').toUpperCase()}` +
+        ` · ${n.quotes_forwarded || 0} quote${n.quotes_forwarded === 1 ? '' : 's'} · 👤 +${digitsOnly(n.buyer_phone)}`
+      )
     }
     lines.push('', 'Reply *close RQ-xxxx* to quiet one, or *digest* for the full report.',
       'Needs from a day? *needs 22-10-2026* (or today / yesterday).')
@@ -3450,6 +3564,61 @@ async function handleAdminCommand(from: string, text: string): Promise<boolean> 
     }
     const num = digitsOnly(clean.slice(8).trim())
     await releaseChat(from, num)
+    return true
+  }
+
+  // Wipe a number's bot-side history so the next message is a first hello.
+  // Listings, orders, needs and payments are business records - never touched.
+  if (lower === 'reset' || lower.startsWith('reset ')) {
+    if (!(await isBotAdmin(from))) {
+      await sendWhatsAppMessage(from, '🔒 This command is for administrators only.')
+      return true
+    }
+    const parts = clean.slice(5).trim().split(/\s+/).filter(Boolean)
+    const num = digitsOnly(parts[0] || '')
+    const confirmed = (parts[1] || '').toLowerCase() === 'confirm'
+    if (num.length < 8) {
+      await sendWhatsAppMessage(from, 'Usage: *reset 263771234567* (then confirm)')
+      return true
+    }
+    const variants = [num, `+${num}`]
+    const tables = ['bot_contacts', 'chat_sessions', 'conversation_state', 'bot_messages', 'bot_searches']
+    if (!confirmed) {
+      const counts: string[] = []
+      for (const table of tables) {
+        const { count } = await getSupabase()
+          .from(table)
+          .select('phone', { count: 'exact', head: true })
+          .in('phone', variants)
+        counts.push(`${table}: ${count ?? 0}`)
+      }
+      await sendWhatsAppMessage(
+        from,
+        [
+          `⚠️ *Reset +${num}?*`,
+          '',
+          'This deletes their bot contact, chat session, transcript, search history and onboarding state.',
+          'Listings, orders, needs, quotes and payments are left alone.',
+          '',
+          counts.join(' · '),
+          '',
+          `Reply *reset ${num} confirm* to do it.`,
+        ].join('\n')
+      )
+      return true
+    }
+    const removed: string[] = []
+    for (const table of tables) {
+      const { count, error } = await getSupabase()
+        .from(table)
+        .delete({ count: 'exact' })
+        .in('phone', variants)
+      removed.push(`${table}: ${error ? 'failed' : count ?? 0}`)
+    }
+    await sendWhatsAppMessage(
+      from,
+      `🧹 *+${num} reset*\n${removed.join(' · ')}\nThey will be treated as a first-time user on their next message.`
+    )
     return true
   }
 
@@ -4331,6 +4500,26 @@ async function handleAction(from: string, session: ChatSession | null, action: s
   const oclaim = action.match(/^oclaim_(\d+)$/)
   if (oclaim) {
     await handleClaimTap(from, session, Number(oclaim[1]))
+    return
+  }
+  const askContact = action.match(/^ask_contact_(\d+)$/)
+  if (askContact) {
+    await handleAskContact(from, Number(askContact[1]))
+    return
+  }
+  const askPhoto = action.match(/^ask_photo_(\d+)$/)
+  if (askPhoto) {
+    await handleAskPhoto(from, Number(askPhoto[1]))
+    return
+  }
+  const contactYes = action.match(/^contact_yes_(\d+)$/)
+  if (contactYes) {
+    await handleContactConsent(from, true, Number(contactYes[1]))
+    return
+  }
+  const contactNo = action.match(/^contact_no_(\d+)$/)
+  if (contactNo) {
+    await handleContactConsent(from, false, Number(contactNo[1]))
     return
   }
 
@@ -5376,6 +5565,7 @@ async function renderPendingVerify(
     )
     return
   }
+  const photos = session?.data.pendingOrder?.photos || []
   const pendingOrder: PendingOrder = {
     groups: groups.map(g => ({
       businessId: g.supplier.businessId,
@@ -5384,6 +5574,7 @@ async function renderPendingVerify(
       city: g.supplier.city || undefined,
       lines: g.lines.map(l => ({ name: l.item.name, qty: l.qty, price: l.item.price })),
     })),
+    photos,
   }
   await saveSession(from, 'order', { ...(session?.data || {}), pendingOrder })
   const note =
@@ -5394,7 +5585,13 @@ async function renderPendingVerify(
           'These are skipped for now - type the order again to fix them BEFORE sending.',
         ].join('\n')
       : ''
-  await sendWhatsAppMessage(from, `${renderOrderVerify(pendingOrder.groups)}\n${note}`)
+  const photoLine = photos.length
+    ? `📸 ${photos.length} photo${photos.length === 1 ? '' : 's'} attached. Send another, or tap ✅ Send order.`
+    : '📷 Got a photo for this order? Send it here - optional, I attach it for the shop.'
+  await sendWhatsAppMessage(
+    from,
+    `${renderOrderVerify(pendingOrder.groups)}\n${note}${note ? '\n' : '\n\n'}${photoLine}`
+  )
   await sendInteractiveButtons(from, 'Does that look right? Send it, or re-type it.', [
     { id: 'osend', title: '✅ Send order' },
     { id: 'oedit', title: '✎ Re-type' },
@@ -5421,7 +5618,17 @@ async function commitPendingOrder(from: string, session: ChatSession | null) {
       lines: g.lines,
       city: g.city,
     })
-    if (row) rows.push(row)
+    if (row) {
+      // Photos live on the order trace (JSONB), so no schema change is needed.
+      // The buyer's photo events survive later push/claim events.
+      const photos = (pending.photos || []).slice(0, 3)
+      if (photos.length) {
+        const trace = photos.map(url => ({ event: 'photo', url, at: new Date().toISOString() }))
+        await getSupabase().from('supply_orders').update({ trace }).eq('id', row.id)
+        row.trace = trace
+      }
+      rows.push(row)
+    }
   }
   if (!rows.length) {
     await sendWhatsAppMessage(from, '⚠️ Could not file the order - try again in a minute.')
@@ -5483,6 +5690,14 @@ async function commitPendingOrder(from: string, session: ChatSession | null) {
   }
 }
 
+/** Buyer photos stored as trace events on a supply order (max 3). */
+function orderPhotoUrls(row: SupplyOrderRow): string[] {
+  return ((row.trace || []) as { event?: string; url?: string }[])
+    .filter(t => t.event === 'photo' && typeof t.url === 'string' && t.url)
+    .map(t => String(t.url))
+    .slice(0, 3)
+}
+
 /** Push one committed slice to the supplier. true = DMd or templated,
  * false = they have WhatsApp but haven't spoken to the bot lately,
  * null = no wa.me target at all (they get the sold-out list + digest). */
@@ -5495,6 +5710,7 @@ async function pushOrderToSupplier(row: SupplyOrderRow, buyerPhone: string): Pro
   const b = biz as { phone: string | null; phone_type: string | null; whatsapp_link: string | null } | null
   const digits = b ? await cartWaDigits(b.phone_type, b.phone || '', b.whatsapp_link) : ''
   const shortUrl = `${SITE_URL}/go/o/${row.token}`
+  const photos = orderPhotoUrls(row)
   const body = [
     '🧾 *New order on WA Directory*',
     '',
@@ -5512,10 +5728,13 @@ async function pushOrderToSupplier(row: SupplyOrderRow, buyerPhone: string): Pro
         : []
     })(),
     '',
-    `Buyer: +${digitsOnly(buyerPhone)}`,
+    ...(photos.length
+      ? [`📸 ${photos.length} photo${photos.length === 1 ? '' : 's'} from the buyer - below.`, '']
+      : []),
+    '🔒 Buyer contact is hidden until they agree to share it.',
     `Checkout: ${shortUrl}`,
     '',
-    'Tap ✅ when you can supply - the buyer is notified instantly.',
+    'Tap ✅ when you can supply - or 📱 Ask for contact to request their number.',
   ].join('\n')
 
   if (!digits) {
@@ -5528,8 +5747,16 @@ async function pushOrderToSupplier(row: SupplyOrderRow, buyerPhone: string): Pro
       await sendWhatsAppMessage(digits, body)
       await sendInteractiveButtons(digits, 'Can you supply this order?', [
         { id: `oclaim_${row.id}`, title: '✅ I can supply' },
+        { id: `ask_contact_${row.id}`, title: '📱 Ask for contact' },
+        { id: `ask_photo_${row.id}`, title: '📸 Ask for photo' },
       ])
+      for (const [n, url] of photos.entries()) {
+        await sendWhatsAppImage(digits, url, `📸 Buyer photo ${n + 1}/${photos.length} · ${row.token}`)
+      }
       await bumpOrderTrace(row.id, { event: 'push-dm', at: new Date().toISOString() })
+      if (photos.length) {
+        await bumpOrderTrace(row.id, { event: 'photos-dm', count: photos.length, at: new Date().toISOString() })
+      }
       return true
     } catch {
       // window/escalation failure — fall through to the silent path below
@@ -5538,7 +5765,7 @@ async function pushOrderToSupplier(row: SupplyOrderRow, buyerPhone: string): Pro
   const tpl = process.env.WHATSAPP_TEMPLATE_ORDER
   if (tpl && !active) {
     try {
-      await sendWhatsAppTemplate(digits, tpl, [row.biz_name, buyerPhone, shortUrl])
+      await sendWhatsAppTemplate(digits, tpl, [row.biz_name, shortUrl])
       await bumpOrderTrace(row.id, { event: 'push-template', at: new Date().toISOString() })
       return true
     } catch {
@@ -5551,10 +5778,11 @@ async function pushOrderToSupplier(row: SupplyOrderRow, buyerPhone: string): Pro
 
 async function bumpOrderTrace(id: number, event: Record<string, unknown>) {
   try {
-    await getSupabase()
-      .from('supply_orders')
-      .update({ trace: [event] })
-      .eq('id', id)
+    const row = await getSupplyOrderById(id)
+    if (!row) return
+    // Append, never overwrite: buyer photo events live in this same trace.
+    const trace = [...(row.trace || []), event].slice(-40)
+    await getSupabase().from('supply_orders').update({ trace }).eq('id', id)
   } catch {
     // tracer is cosmetic — ignore failures
   }
@@ -5597,6 +5825,23 @@ function orderTotal(row: SupplyOrderRow): number {
   return sumLines((row.lines || []) as { qty: number; price: number | null }[])
 }
 
+/** Claim a row without dropping the trace (buyer photos live there). */
+async function claimOrder(orderId: number): Promise<SupplyOrderRow | null> {
+  const existing = await getSupplyOrderById(orderId)
+  if (!existing) return null
+  if (existing.status !== 'open' && existing.status !== 'sent') return null
+  const trace = [...(existing.trace || []), { event: 'claimed', at: new Date().toISOString() }]
+  const { data } = await getSupabase()
+    .from('supply_orders')
+    .update({ status: 'claimed', closed_at: null, trace })
+    .eq('id', orderId)
+    .in('status', ['open', 'sent'])
+    .select('id')
+    .maybeSingle()
+  if (!data) return null
+  return await getSupplyOrderById(orderId)
+}
+
 /** Supplier taps ✅ I can supply: claim the sale and arm the buyer. */
 async function handleClaimTap(from: string, session: ChatSession | null, orderId: number) {
   const row = await getSupplyOrderById(orderId)
@@ -5615,11 +5860,13 @@ async function handleClaimTap(from: string, session: ChatSession | null, orderId
     await sendWhatsAppMessage(from, 'Only the shop WhatsApp can confirm its orders.')
     return
   }
-  const claimed = await claimSupplyOrder(orderId)
+  const claimed = await claimOrder(orderId)
   if (!claimed) {
     await sendWhatsAppMessage(from, 'Already confirmed - the buyer knows.')
     return
   }
+  const photos = orderPhotoUrls(claimed)
+  const contact = buyerContactState(claimed)
   const buyer = digitsOnly(row.buyer_phone)
   // The buyer's status update repeats the order exactly as they confirmed it:
   // every line with its quantity, the line total and the order total.
@@ -5650,7 +5897,7 @@ async function handleClaimTap(from: string, session: ChatSession | null, orderId
       `*${row.biz_name}* confirmed your order - say hi and lock in pickup/delivery 🛒`,
       '💬 Chat shop ▸',
       `https://wa.me/${digits}?text=${encodeURIComponent(
-        `Hello! I placed order wa.directory/go/o/${row.token} - my number was shared.`
+        `Hello! I placed order wa.directory/go/o/${row.token}.`
       )}`
     )
   }
@@ -5662,13 +5909,176 @@ async function handleClaimTap(from: string, session: ChatSession | null, orderId
   })
   await sendInteractiveButtons(
     from,
-    '✅ Noted — your buyer has your number.\n\nAnything to change? Send a message, or change the price.',
+    (contact === 'shared'
+      ? `✅ Noted — buyer contact: +${buyer}.`
+      : '✅ Noted — the buyer\'s number stays private until they agree.') +
+      '\n\nAnything to change? Send a message, or change the price.',
     [
       { id: `co_price_${row.id}`, title: '💰 Change price' },
       { id: `co_note_${row.id}`, title: '💬 Add a message' },
       { id: 'note_skip', title: '⏭ Skip' },
     ]
   )
+  const followUp: { id: string; title: string }[] = []
+  if (contact === 'none' || contact === 'asked') {
+    followUp.push({ id: `ask_contact_${row.id}`, title: '📱 Ask for contact' })
+  }
+  followUp.push({ id: `ask_photo_${row.id}`, title: '📸 Ask for photo' })
+  await sendInteractiveButtons(from, 'Need anything from the buyer?', followUp)
+  // Template-delivered orders never carried the photos; the claim opens a
+  // 24h window, so send them now. DM pushes already attached them.
+  const photosDelivered = (claimed.trace || []).some(e => (e as { event?: string }).event === 'photos-dm')
+  if (photos.length && !photosDelivered) {
+    for (const [n, url] of photos.entries()) {
+      await sendWhatsAppImage(from, url, `📸 Buyer photo ${n + 1}/${photos.length} · ${row.token}`)
+    }
+  }
+}
+
+/** Where the buyer's contact consent landed. The latest event wins. */
+type BuyerContactState = 'none' | 'asked' | 'shared' | 'declined'
+function buyerContactState(row: SupplyOrderRow): BuyerContactState {
+  const last = [...(row.trace || [])]
+    .reverse()
+    .map(t => String((t as { event?: string }).event || ''))
+    .find(e => e === 'contact-asked' || e === 'contact-shared' || e === 'contact-declined')
+  return last === 'contact-asked' ? 'asked' : last === 'contact-shared' ? 'shared' : last === 'contact-declined' ? 'declined' : 'none'
+}
+
+/** Supplier taps 📱 Ask for contact: ask the buyer, never reveal by default. */
+async function handleAskContact(from: string, orderId: number) {
+  const row = await getSupplyOrderById(orderId)
+  if (!row) {
+    await sendWhatsAppMessage(from, 'That order is gone - send *orders* to see the current ones.')
+    return
+  }
+  const shop = await businessWhatsAppDigits(row.biz_id)
+  if (shop && digitsOnly(from) !== shop) {
+    await sendWhatsAppMessage(from, 'Only the shop WhatsApp on this order can ask for contact.')
+    return
+  }
+  if (row.status === 'closed') {
+    await sendWhatsAppMessage(from, 'That order has expired - the buyer cannot be asked now.')
+    return
+  }
+  const state = buyerContactState(row)
+  const buyer = digitsOnly(row.buyer_phone)
+  if (state === 'shared') {
+    await sendWhatsAppMessage(from, `📱 The buyer already shared their number: +${buyer}`)
+    return
+  }
+  if (state === 'declined') {
+    await sendWhatsAppMessage(
+      from,
+      '🚫 The buyer declined to share their number. You can still send them a message here and I will pass it on.'
+    )
+    return
+  }
+  if (state === 'asked') {
+    await sendWhatsAppMessage(from, '⏳ Already asked - I will tell you as soon as the buyer answers.')
+    return
+  }
+  if (!buyer) {
+    await sendWhatsAppMessage(from, 'This order has no buyer number to ask.')
+    return
+  }
+  await bumpOrderTrace(row.id, { event: 'contact-asked', at: new Date().toISOString() })
+  await sendInteractiveButtons(
+    buyer,
+    `👋 *${row.biz_name}* is asking for your number for order *${row.token}*.\n\nShare it with them?`,
+    [
+      { id: `contact_yes_${row.id}`, title: '✅ Share number' },
+      { id: `contact_no_${row.id}`, title: '🚫 Keep private' },
+    ]
+  )
+  await sendWhatsAppMessage(from, '📨 Asked the buyer - I will tell you as soon as they answer.')
+}
+
+/** Supplier taps 📸 Ask for photo: request one product photo from the buyer. */
+async function handleAskPhoto(from: string, orderId: number) {
+  const row = await getSupplyOrderById(orderId)
+  if (!row) {
+    await sendWhatsAppMessage(from, 'That order is gone - send *orders* to see the current ones.')
+    return
+  }
+  const shop = await businessWhatsAppDigits(row.biz_id)
+  if (shop && digitsOnly(from) !== shop) {
+    await sendWhatsAppMessage(from, 'Only the shop WhatsApp on this order can ask for a photo.')
+    return
+  }
+  if (row.status === 'closed') {
+    await sendWhatsAppMessage(from, 'That order has expired - the buyer cannot be asked now.')
+    return
+  }
+  const last = [...(row.trace || [])]
+    .reverse()
+    .map(t => String((t as { event?: string }).event || ''))
+    .find(e => e === 'photo-requested' || e === 'photo-sent')
+  if (last === 'photo-requested') {
+    await sendWhatsAppMessage(from, '⏳ Already asked - I will pass on the photo as soon as the buyer sends it.')
+    return
+  }
+  const buyer = digitsOnly(row.buyer_phone)
+  if (!buyer) {
+    await sendWhatsAppMessage(from, 'This order has no buyer number to ask.')
+    return
+  }
+  await bumpOrderTrace(row.id, { event: 'photo-requested', at: new Date().toISOString() })
+  const buyerSession = await getSession(buyer)
+  await saveSession(buyer, buyerSession?.step || 'browse', {
+    ...(buyerSession?.data || {}),
+    order_photo_request_id: row.id,
+  })
+  await sendWhatsAppMessage(
+    buyer,
+    `📸 *${row.biz_name}* wants a photo of the product for order *${row.token}*.\n\nSend it here and I will pass it to them.`
+  )
+  await sendWhatsAppMessage(from, '📸 Asked the buyer for a product photo - I will forward it when it arrives.')
+}
+
+/** Buyer taps Share / Keep private on a supplier's contact request. */
+async function handleContactConsent(from: string, yes: boolean, orderId: number) {
+  const row = await getSupplyOrderById(orderId)
+  if (!row) {
+    await sendWhatsAppMessage(from, 'That order is gone - nothing was shared.')
+    return
+  }
+  if (digitsOnly(row.buyer_phone) !== digitsOnly(from)) {
+    await sendWhatsAppMessage(from, 'Only the buyer on this order can answer that.')
+    return
+  }
+  const state = buyerContactState(row)
+  if (state === 'shared') {
+    await sendWhatsAppMessage(from, '✅ You already shared your number on this order.')
+    return
+  }
+  if (state === 'declined') {
+    await sendWhatsAppMessage(from, '👍 You already kept your number private on this order.')
+    return
+  }
+  const shop = await businessWhatsAppDigits(row.biz_id)
+  const buyer = digitsOnly(row.buyer_phone)
+
+  if (!yes) {
+    await bumpOrderTrace(row.id, { event: 'contact-declined', at: new Date().toISOString() })
+    await sendWhatsAppMessage(from, '👍 Okay - your number was not shared.')
+    if (shop) {
+      await sendWhatsAppMessage(
+        shop,
+        `🚫 The buyer for order *${row.token}* chose not to share their number. You can still send them a message here and I will pass it on.`
+      )
+    }
+    return
+  }
+
+  await bumpOrderTrace(row.id, { event: 'contact-shared', at: new Date().toISOString() })
+  await sendWhatsAppMessage(from, `✅ Shared - *${row.biz_name}* can now WhatsApp you.`)
+  if (shop) {
+    await sendWhatsAppMessage(
+      shop,
+      `📱 The buyer for order *${row.token}* shared their number: +${buyer}\nSay hi and lock in pickup or delivery.`
+    )
+  }
 }
 
 /** Rewrite the order's prices to the shop's counter-offer and ask the buyer to
@@ -5849,10 +6259,15 @@ async function sendSupplierOrders(from: string, session: ChatSession | null) {
     const summary = ((r.lines || []) as { name: string; qty: number }[])
       .map(l => `${l.qty} × ${l.name}`)
       .join(', ')
-    lines.push(`*${r.token}* · ${r.buyer_phone ? '+' + digitsOnly(r.buyer_phone) : ''}`)
+    const photoCount = orderPhotoUrls(r).length
+    const contact = buyerContactState(r)
+    lines.push(
+      `*${r.token}* · ${contact === 'shared' && r.buyer_phone ? '+' + digitsOnly(r.buyer_phone) : '🔒 buyer number private'}`
+    )
     lines.push(`↳ ${summary}`)
     const bits = [
       `*${monoUSD(orderTotal(r)).replace(/`/g, '')}*`,
+      photoCount ? `📸 ${photoCount} photo${photoCount === 1 ? '' : 's'}` : '',
       (() => {
         const c = counterState(r)
         if (c === 'pending') return '💰 your new price: awaiting buyer'
@@ -5870,6 +6285,72 @@ async function sendSupplierOrders(from: string, session: ChatSession | null) {
     'Tap to confirm an order - the buyer is notified instantly.',
     allRows.slice(0, 3).map(r => ({ id: `oclaim_${r.id}`, title: `✅ ${r.token}` }))
   )
+  const photoRows = allRows.slice(0, 3).filter(r => orderPhotoUrls(r).length)
+  if (photoRows.length) {
+    await sendWhatsAppMessage(
+      from,
+      `📸 See the buyer's photos: reply */photos ${photoRows[0].token}*` +
+        (photoRows.length > 1
+          ? `\nOther orders with photos: ${photoRows.slice(1).map(r => `*${r.token}*`).join(', ')}`
+          : '')
+    )
+  }
+}
+
+/** `/photos CODE` for a shop: the buyer's attachments on one open order. */
+async function sendOrderPhotos(from: string, tokenArg: string) {
+  const digits = digitsOnly(from)
+  const { data: bizRows } = await getSupabase()
+    .from('businesses')
+    .select('id')
+    .or(`phone.ilike.${digits},phone.ilike.+${digits},phone.ilike.%${digits}`)
+    .limit(3)
+  const bizIds = ((bizRows || []) as { id: string }[]).map(b => b.id)
+  if (!bizIds.length) {
+    await sendWhatsAppMessage(from, 'No shop synced to this WhatsApp number yet. List yours first - *menu*.')
+    return
+  }
+
+  const token = tokenArg.trim().toUpperCase()
+  if (token) {
+    const row = await getOrderByToken(token)
+    if (!row || !row.biz_id || !bizIds.includes(row.biz_id)) {
+      await sendWhatsAppMessage(from, `I can't find order *${token}* on your shop.`)
+      return
+    }
+    const photos = orderPhotoUrls(row)
+    if (!photos.length) {
+      await sendWhatsAppMessage(from, `Order *${row.token}* has no buyer photos.`)
+      return
+    }
+    for (const [n, url] of photos.entries()) {
+      await sendWhatsAppImage(from, url, `📸 ${row.biz_name} · ${row.token} · photo ${n + 1}/${photos.length}`)
+    }
+    return
+  }
+
+  const rows: SupplyOrderRow[] = []
+  for (const id of bizIds) rows.push(...(await listOrdersForBusiness(id, 3)))
+  const withPhotos = rows.filter(r => orderPhotoUrls(r).length)
+  if (!withPhotos.length) {
+    await sendWhatsAppMessage(from, 'No buyer photos on your open orders.')
+    return
+  }
+  if (withPhotos.length > 1) {
+    await sendWhatsAppMessage(
+      from,
+      [
+        '📸 Which order? Reply */photos CODE*:',
+        ...withPhotos.map(r => `• *${r.token}* - ${orderPhotoUrls(r).length} photo${orderPhotoUrls(r).length === 1 ? '' : 's'}`),
+      ].join('\n')
+    )
+    return
+  }
+  const row = withPhotos[0]
+  const photos = orderPhotoUrls(row)
+  for (const [n, url] of photos.entries()) {
+    await sendWhatsAppImage(from, url, `📸 ${row.biz_name} · ${row.token} · photo ${n + 1}/${photos.length}`)
+  }
 }
 
 /** Buyer-side tracker: status of their open rows + drop-in stats fodder. */
@@ -6309,11 +6790,16 @@ async function handleCheckoutCart(from: string, session: ChatSession | null) {
     })
   }
 
-  const pendingOrder: PendingOrder = { groups }
+  const photos = session?.data.pendingOrder?.photos || []
+  const pendingOrder: PendingOrder = { groups, photos }
   await saveSession(from, 'order', { ...(session?.data || {}), pendingOrder })
   await sendWhatsAppMessage(
     from,
-    `${renderOrderVerify(groups, 'Tap ✅ to send these orders, or 🛒 to change quantities.')}\n\nNothing is sent until you confirm.`
+    `${renderOrderVerify(groups, 'Tap ✅ to send these orders, or 🛒 to change quantities.')}\n\n` +
+      (photos.length
+        ? `📸 ${photos.length} photo${photos.length === 1 ? '' : 's'} attached. Send another, or tap ✅ Send all orders.`
+        : '📷 Got a photo for this order? Send it here - optional, the shop will see it.') +
+      '\nNothing is sent until you confirm.'
   )
   await sendInteractiveButtons(from, 'Send these orders to the shops?', [
     { id: 'osend', title: '✅ Send all orders' },
@@ -6963,6 +7449,14 @@ export async function POST(request: Request) {
         }
         if (lower === 'orders' || lower.startsWith('orders ')) {
           await sendSupplierOrders(from, session)
+          continue
+        }
+        // Buyer photos on an order. Slash form, or `photos CODE`, so a plain
+        // "photos" search still reaches photographers.
+        const photosCmd =
+          lower.match(/^\/photos(?:\s+([a-z0-9]{4,8}))?$/) || lower.match(/^photos\s+([a-z0-9]{4,8})$/)
+        if (photosCmd) {
+          await sendOrderPhotos(from, photosCmd[1] || '')
           continue
         }
 

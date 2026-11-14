@@ -50,6 +50,8 @@ export interface ChatSessionData {
   order_note_token?: string
   // Supplier is typing a counter-price for that order.
   order_counter_id?: number
+  // Supplier asked the buyer for a product photo on this order.
+  order_photo_request_id?: number
   // Where the search originated, so Back can restore the previous prompt.
   origin?: 'search_loc' | 'search_term' | 'free'
   // Search label of the current results, for Back re-rendering.
@@ -155,6 +157,9 @@ export interface PendingGroup {
 export interface PendingOrder {
   groups: PendingGroup[]
   clearable?: string[]
+  // Buyer photos attached to the whole order (max 3). Public URLs so they can
+  // ride along in the supplier's WhatsApp message.
+  photos?: string[]
 }
 
 export interface ChatSession {
