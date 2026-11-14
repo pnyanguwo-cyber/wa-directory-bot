@@ -84,7 +84,7 @@ const PIVOT_FRAME =
 // goals ("register and pay") lands on the first.
 const GOAL: Record<PivotKind, RegExp> = {
   register:
-    /\b(?:register(?:ing|ation)?|sign ?(?:me )?up|list (?:my|our|a|the) (?:business|company|shop|store|service|listing)|get (?:my |our )?(?:business|listing) (?:on|listed)|add (?:my|our|a) business|put (?:my|our) business|advertise|business listing|join (?:the )?directory|personal contact)\b/i,
+    /\b(?:register(?:ing|ation)?|sign ?(?:me )?up|list (?:my|our|a|the) (?:business|company|shop|store|service|listing)|get (?:my |our )?(?:business|listing) (?:on|listed)|add (?:my|our|a) business|put (?:my|our) business|advertise|business listing|join (?:the )?directory|become (?:a )?(?:supplier|vendor|seller)|start selling|sell on wa directory|personal contact)\b/i,
   pay: /\b(?:pay(?:ment|ing)?|renew(?:al)?|subscrib(?:e|ption)|top up|ecocash)\b/i,
   need: /\b(?:post|add|send) (?:a|my|our) need\b|\bsuppliers? (?:can )?quote/i,
   search: /\b(?:search|find|look for|browse|shop|buy)\b/i,
@@ -97,10 +97,6 @@ const PIVOT_ORDER: PivotKind[] = ['register', 'pay', 'need', 'order', 'search', 
 // Bare commands: the whole message *is* the request. Exact-match only, so a
 // search for "register office" or "advertising agencies" stays a search.
 const BARE_PIVOTS: [RegExp, PivotKind][] = [
-  [
-    /^(?:register(?:ing|ation)?|sign ?(?:me )?up|register(?: my| our| a| the)? (?:business|company|shop|store|listing)|list(?: a| the| my| our)? (?:business|company|shop|store|listing)|add my business|put my business on|business listing)$/,
-    'register',
-  ],
   [/^(?:pay|payment|pay now|pay my bill|renew|renewal|ecocash|top up)$/, 'pay'],
   [
     /^(?:how much (?:is|does|for)(?: an?| the)? (?:listing|business|registration|advert)(?: fee| price)?|listing fee|listing price)$/,
@@ -114,14 +110,77 @@ const BARE_PIVOTS: [RegExp, PivotKind][] = [
 // "advertising agencies", "how much is a school ad".
 const PIVOT_BLOCK = /\b(?:office|agency|agencies|school|hospital|form|plate)\b/
 
+// Registration requests arrive in many shapes: "register", "register my
+// business", "join", "list business", "become a supplier". A bare verb asks
+// which kind of listing to add; a phrase that already names a business (or
+// says it wants to sell) can open the business form directly.
+export type RegistrationCommand = 'choice' | 'start'
+
+const REGISTRATION_GENERIC =
+  /^(?:register|registration|sign\s?up|sign\s?me\s?up|join|list|advertise|enrol|enroll|get listed|be listed)$/i
+const REGISTRATION_VERB =
+  /^(?:register|list|add|create|open|start|put|advertise|join|become|be|enrol|enroll|sell)\b/i
+const REGISTRATION_CONTEXT =
+  /\b(?:business|company|shop|store|listing|profile|supplier|vendor|seller|account|enterprise|organisation|organization|brand|directory|products?|services?)\b/i
+const REGISTRATION_NOUN_FIRST =
+  /^(?:business|company|shop|store|listing|profile|supplier|vendor|seller|account)\s+(?:registration|signup|sign up|listing|setup|set up)$/i
+
+export function registrationCommand(text: string): RegistrationCommand | null {
+  let t = text
+    .trim()
+    .toLowerCase()
+    .replace(/[’]/g, "'")
+    .replace(/\s+/g, ' ')
+    .replace(/[.!?,;:]+$/, '')
+  if (!t || t.length > 80) return null
+
+  t = t
+    .replace(/^(?:hi|hello|hey)[, ]+/, '')
+    .replace(
+      /^(?:please\s+)?(?:i\s+want\s+to|i\s+would\s+like\s+to|i'd\s+like\s+to|i\s+need\s+to|can\s+i|could\s+i|how\s+do\s+i|how\s+can\s+i|how\s+to|where\s+do\s+i|where\s+can\s+i)\s+/,
+      ''
+    )
+    .replace(/^please\s+/, '')
+    .replace(/\s+(?:please|now|today)$/, '')
+  if (!t) return null
+
+  // Keep search-shaped messages out: "register office", "list of hardware
+  // stores", "advertising agencies".
+  if (PIVOT_BLOCK.test(t) || /^list\s+of\b/.test(t)) return null
+
+  if (REGISTRATION_GENERIC.test(t)) return 'choice'
+
+  // "register my bakery", "list our shop" — the owner already supplied enough
+  // context to skip the business/personal question.
+  if (/^(?:register|list|add|create|open|put|advertise|join)\b.*\b(?:my|our)\b/.test(t)) {
+    return 'start'
+  }
+
+  if (/^(?:start|begin)\s+(?:selling|trading)\b/.test(t)) return 'start'
+  if (/^sell\s+(?:on|with|through)\s+(?:wa\s*directory|whatsapp|here)\b/.test(t)) return 'start'
+  if (/^sell$/.test(t)) return 'choice'
+
+  // "get my business listed" is more specific than bare "get listed".
+  if (/^get\s+(?:my\s+|our\s+)?(?:business|company|shop|store|profile|listing)\s+listed$/.test(t)) {
+    return 'start'
+  }
+
+  if (REGISTRATION_CONTEXT.test(t) && REGISTRATION_VERB.test(t)) return 'start'
+  if (REGISTRATION_NOUN_FIRST.test(t)) return 'start'
+
+  // "register and pay", "register for me" — still a registration intent,
+  // just not enough detail to choose business vs personal.
+  if (/^(?:register|sign\s?up|list|advertise)\b/.test(t) && t.split(' ').length <= 4) {
+    return 'choice'
+  }
+
+  return null
+}
+
 // Short goal starters without any framing word — "register business",
 // "how much is a listing". Unambiguous intents only, outside the data-entry
 // steps where a short message may simply be the answer they were typing.
 const PIVOT_STARTERS: [RegExp, PivotKind][] = [
-  [
-    /\b(?:register(?:ing|ation)?|sign ?up|business registration|list(?:ing)? (?:a |the )?(?:business|company|shop|store)|get listed|advert(?:ise|isement)?)\b/i,
-    'register',
-  ],
   [/\b(?:how much|listing fee|payment|pay)\b/i, 'pay'],
   [/\b(?:i need|we need|looking for suppliers?|suppliers (?:to|can)|quote)\b/i, 'need'],
 ]
@@ -147,6 +206,15 @@ export function detectPivot(text: string, step: string | null): PivotKind | null
   const t = text.trim().replace(/\s+/g, ' ').toLowerCase()
   if (!t || t.length > 400) return null
   const family = familyOf(step)
+
+  // 0 — registration has the widest vocabulary ("register business", "join",
+  // "list our shop", "become a supplier"). Keep the direct-answer steps safe:
+  // a specific business phrase is not an answer to "Which town?", while a bare
+  // goal word still escapes any flow.
+  const regCommand = registrationCommand(t)
+  if (regCommand && family !== 'register') {
+    if (regCommand === 'choice' || !DATA_ENTRY_STEPS.has(step || '')) return 'register'
+  }
 
   // 1 — the whole message is the request ("register", "post a need").
   for (const [re, kind] of BARE_PIVOTS) {

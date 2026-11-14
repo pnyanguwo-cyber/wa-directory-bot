@@ -4,6 +4,7 @@ import {
   familyOf,
   pivotCandidateForIntent,
   DATA_ENTRY_STEPS,
+  registrationCommand,
 } from '../lib/intent-pivot'
 
 // Pivot-rule smoke (run: npx tsx scripts/pivot-smoke.ts) — the regex layer of
@@ -69,6 +70,23 @@ ok(dp('register and pay', 'order') === 'register', 'first goal wins (PIVOT_ORDER
 ok(dp('register business', 'city') === null, 'starter inside register family stays put')
 ok(dp('register office', 'order') === null, '"register office" blocked (PIVOT_BLOCK)')
 ok(dp('advertising agencies', 'search_loc') === null, '"advertising agencies" blocked')
+
+// Registration vocabulary — all the ways people ask to be listed.
+const regStart = (t: string) => registrationCommand(t) === 'start'
+const regChoice = (t: string) => registrationCommand(t) === 'choice'
+ok(regChoice('register') && regChoice('join') && regChoice('list') && regChoice('sign me up'), 'bare register verbs ask business vs personal')
+ok(
+  ['register business', 'register a business', 'register my business', 'join wa directory', 'list business', 'list my company', 'get my business listed', 'add my business', 'create a listing', 'open a shop', 'become a supplier', 'i want to register my shop', 'how do i list my business', 'start selling on wa directory', 'sell on wa directory', 'business registration', 'list my bakery'].every(
+    regStart
+  ),
+  'business-specific registration phrases open the form'
+)
+ok(regChoice('i want to register') && regChoice('how do i register') && regChoice('can i list'), 'framed generic register requests still ask the type')
+ok(dp('register business', 'order') === 'register' && dp('join', 'order') === 'register' && dp('list business', 'order') === 'register', 'registration variants pivot mid-conversation')
+ok(dp('i want to register', 'order') === 'register' && dp('become a supplier', 'order') === 'register', 'framed registration pivots too')
+ok(dp('register my business', 'need_form') === null && dp('list business', 'name') === null, 'specific register phrases do not hijack direct-answer steps')
+ok(dp('list of hardware stores', 'order') === null && dp('register office', 'order') === null, 'search-shaped list/register phrases stay searches')
+ok(registrationCommand('advertising agencies') === null && registrationCommand('apply for a job') === null, 'unrelated phrases are not registration')
 ok(dp('harare', 'search_loc') === null, 'town name stays a search answer')
 ok(dp('a'.repeat(400) + ' register', 'order') === null, 'oversized text is never a pivot')
 

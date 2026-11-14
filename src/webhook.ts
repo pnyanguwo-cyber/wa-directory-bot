@@ -63,6 +63,7 @@ import {
   familyOf,
   pivotCandidateForIntent,
   goalKindForWord,
+  registrationCommand,
   type GoalAskKind,
 } from '../lib/intent-pivot.js'
 import {
@@ -7403,15 +7404,13 @@ export async function POST(request: Request) {
           continue
         }
 
-        const mReg = text
-          .trim()
-          .match(/^(register|list me|list my|list on|list|get listed|add my business|sign me up|advertise\b|sell\b.*\b(list|advertise|get listed)\b|i want to (list|sell|advertise)|join\b)\b(.*)$/i)
-        if (mReg) {
-          const trailing = mReg[4].trim()
-          if (!trailing || /^(?:me|my business|my company|my shop|myself|us)$/i.test(trailing)) {
+        const regCommand = registrationCommand(text)
+        if (regCommand) {
+          if (regCommand === 'choice') {
             await sendRegisterChoice(from)
           } else {
-            // User typed something like "register my bakery" - start with the new flow
+            // The message already names a business (or a supplier/shop), so
+            // skip the business-vs-personal question and open the form.
             await startRegistrationFlow(from)
           }
           continue
