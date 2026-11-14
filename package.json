@@ -24,5 +24,8 @@
   },
   "engines": {
     "node": ">=20"
+  },
+  "allowScripts": {
+    "github:pnyanguwo-cyber/wa-directory-shared#2efbdaa9f2aab7808e3a3d26faeb171f38128096": true
   }
 }
