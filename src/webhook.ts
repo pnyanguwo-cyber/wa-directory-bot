@@ -3631,8 +3631,8 @@ async function handleAdminCommand(from: string, text: string): Promise<boolean> 
     const adminClean = clean.slice(9).trim()
     const adminLower = adminClean.toLowerCase()
 
-        // near <city>
-    const nearMatch = adminClean.match(/^near\\s+(.+)$/i)
+    // near <city>
+    const nearMatch = adminClean.match(/^near\s+(.+)$/i)
     if (nearMatch) {
       const city = nearMatch[1].trim()
       const results = await findEmergencyNear(city)
@@ -4204,7 +4204,9 @@ async function handleAdminCommand(from: string, text: string): Promise<boolean> 
           from,
           `✅ *${biz.name}* approved - live in search for ${days || 30} days${until ? ` (until ${until})` : ''}.`
         )
-        if (biz.phone && digitsOnly(biz.phone) !== digitsOnly(from)) {
+        // Always notify the owner — verifying your own listing still deserves
+        // the go-live message with all the links (profile, website, portal).
+        if (biz.phone) {
           await notifyBusinessLive(biz)
         }
       } else {
@@ -6311,7 +6313,7 @@ async function sendOrderPhotos(from: string, tokenArg: string) {
     return
   }
 
-  const token = tokenArg.trim().toUpperCase()
+  const token = (tokenArg || '').trim().toUpperCase()
   if (token) {
     const row = await getOrderByToken(token)
     if (!row || !row.biz_id || !bizIds.includes(row.biz_id)) {
