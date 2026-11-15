@@ -4988,7 +4988,10 @@ async function handleAction(from: string, session: ChatSession | null, action: s
     case 'reg_skip':
     case 'reg_proceed':
     case 'reg_publish':
-    case 'reg_edit': {
+    case 'reg_edit':
+    case 'reg_talk_admin':
+    case 'reg_ask_admin_permission':
+    case 'reg_change_phone': {
       const convState = await getConversationState(from)
       if (convState && convState.state.startsWith('REGISTRATION_')) {
         await handleRegistrationMessage(from, action, convState.context)
@@ -7378,6 +7381,16 @@ export async function POST(request: Request) {
           continue
         }
 
+        // ── New registration flow (REGISTRATION_* states from Supabase) ───────
+        // Checked before the pivot/shelved-draft matchers below: an active
+        // registration owns every text reply, and a stale session row from an
+        // earlier flow must not hijack words like "help me".
+        const convState = await getConversationState(from)
+        if (convState && convState.state.startsWith('REGISTRATION_')) {
+          await handleRegistrationMessage(from, text, convState.context)
+          continue
+        }
+
         // Pick up a flow that an earlier direction change shelved (the draft
         // lives in the session row, which may be the 'idle' placeholder).
         if (
@@ -7789,13 +7802,6 @@ export async function POST(request: Request) {
             ],
             'Choose a package'
           )
-          continue
-        }
-
-        // ── New registration flow (REGISTRATION_* states from Supabase) ───────
-        const convState = await getConversationState(from)
-        if (convState && convState.state.startsWith('REGISTRATION_')) {
-          await handleRegistrationMessage(from, text, convState.context)
           continue
         }
 
