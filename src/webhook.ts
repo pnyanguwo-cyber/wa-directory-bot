@@ -5083,6 +5083,7 @@ async function handleAction(from: string, session: ChatSession | null, action: s
     case 'reg_skip':
     case 'reg_proceed':
     case 'reg_publish':
+    case 'reg_cancel':
     case 'reg_edit':
     case 'reg_talk_admin':
     case 'reg_ask_admin_permission':
