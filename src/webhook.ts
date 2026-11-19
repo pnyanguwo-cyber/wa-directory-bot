@@ -35,7 +35,7 @@ import {
   hasActiveOnboardingState,
   ConversationState,
 } from '@wa-directory/shared'
-import { TRIAL_PLAN_LABEL } from '@wa-directory/shared'
+import { TRIAL_PLAN_LABEL, TRIAL_DAYS } from '@wa-directory/shared'
 import {
   getSession,
   saveSession,
@@ -95,7 +95,7 @@ import {
   type ListingFormState,
 } from '../lib/listing-intake.js'
 import { aiPatchListing } from '../lib/listing-ai.js'
-import { findBusinessesByName, activateListingForDays, notifyBusinessLive, bestNameSimilarity, type VerifyCandidate } from '@wa-directory/shared'
+import { findBusinessesByName, activateListingForDays, notifyBusinessLive, bestNameSimilarity, startTrialForBusiness, type VerifyCandidate } from '@wa-directory/shared'
 import { imageLuminanceFromUrl } from '@wa-directory/shared'
 import { curatedRelatedTerms } from '@wa-directory/shared'
 import { slugify } from '@wa-directory/shared'
@@ -4243,6 +4243,51 @@ async function handleAdminCommand(from: string, text: string): Promise<boolean> 
       // An already-active (paid) listing is just verified — never extended
       // for free unless the admin explicitly typed days.
       const alreadyActive = biz.payment_status === 'active'
+
+      // A listing whose owner asked for the 90-day free trial is approved as a
+      // trial. Approving it with the generic grant silently cut them to 30
+      // days and left the trial request pending forever.
+      let pendingTrial = false
+      if (!days && !alreadyActive) {
+        const { data: trialRows } = await getSupabase()
+          .from('listing_subscriptions')
+          .select('id')
+          .eq('business_id', biz.id)
+          .eq('trial_status', 'requested')
+          .is('trial_activated_at', null)
+          .limit(1)
+        pendingTrial = !!trialRows?.length
+      }
+
+      if (pendingTrial) {
+        const trial = await startTrialForBusiness(biz.id, { adminOverride: true })
+        if (!trial.ok || !trial.trialExpiresAt) {
+          await sendWhatsAppMessage(
+            from,
+            `❌ Could not start the free trial for *${biz.name}*: ${trial.error || 'unknown error'}`
+          )
+          return true
+        }
+        const until = trial.trialExpiresAt.slice(0, 10)
+        await sendWhatsAppMessage(
+          from,
+          `✅ *${biz.name}* approved - ${TRIAL_PLAN_LABEL} started (until ${until}, ${TRIAL_DAYS} days).`
+        )
+        if (biz.phone) {
+          await notifyBusinessLive(biz)
+          await sendWhatsAppMessage(
+            biz.phone,
+            [
+              `🆓 *${TRIAL_PLAN_LABEL} active*`,
+              '',
+              `Your free trial runs until *${until}* (${TRIAL_DAYS} days). No payment is needed.`,
+              'We will remind you before it ends.',
+            ].join('\n')
+          )
+        }
+        return true
+      }
+
       if (days || !alreadyActive) {
         const grant = await activateListingForDays(biz.id, days || 30)
         if (!grant.ok) {
