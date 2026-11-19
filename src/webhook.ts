@@ -3442,6 +3442,56 @@ async function handleAdminCommand(from: string, text: string): Promise<boolean> 
   const clean = text.trim()
   const lower = clean.toLowerCase()
 
+  // ── Add a business on someone else's behalf ──────────────────────────
+  // Admins (and owners) can list a business they do not own. The system asks
+  // for the number that will own it, then invites that number into the same
+  // registration flow — so control of the listing, its portal and every
+  // cart/order reply sits with the owner, never with the admin who keyed it in.
+  const adminSession = await getSession(from)
+  if (adminSession?.step === 'admin_add_business') {
+    if (lower === 'cancel') {
+      await resetForNewSearch(from, adminSession)
+      await sendWhatsAppMessage(from, '✖ Cancelled. Nothing was added.')
+      return true
+    }
+    const rawOwner = digitsOnly(clean)
+    const owner = rawOwner.startsWith('0') ? `263${rawOwner.slice(1)}` : rawOwner
+    if (owner.length < 10 || owner.length > 15) {
+      await sendWhatsAppMessage(
+        from,
+        'Send the owner\'s WhatsApp number in international or local form (e.g. 0771234567 or 263771234567), or type *cancel*.'
+      )
+      return true
+    }
+    await resetForNewSearch(from, adminSession)
+    await startRegistrationFlow(owner, { force: true })
+    await sendWhatsAppMessage(
+      from,
+      [
+        `✅ Invite sent to +${owner}.`,
+        '',
+        'They will be walked through the same registration steps. When they publish, the listing belongs to their number — cart and order replies go to them, not to you.',
+      ].join('\n')
+    )
+    return true
+  }
+
+  if (/^(?:add|list)\s+(?:a\s+)?(?:new\s+)?business$/.test(lower)) {
+    await saveSession(from, 'admin_add_business', { ...(adminSession?.data || {}), addingBusiness: true })
+    await sendWhatsAppMessage(
+      from,
+      [
+        '🏪 *Add a business for someone else*',
+        '',
+        'Send the WhatsApp number that will *own* this listing (e.g. 0771234567).',
+        'We will invite that number to complete the registration. The listing, its portal and every cart/order reply will belong to them — not to you.',
+        '',
+        'Type *cancel* to stop.',
+      ].join('\n')
+    )
+    return true
+  }
+
   if (lower === 'digest' || lower.startsWith('digest ')) {
     const args = clean.slice(6).trim().split(/\s+/).filter(Boolean)
     // Day view: "digest 21-10-2026" (or today / yesterday) compiles that

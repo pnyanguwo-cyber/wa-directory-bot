@@ -27,6 +27,9 @@ export interface ChatSessionData {
   // Personal contact draft (step 'reg_contact'): name + phone + optional
   // city and up to 3 social links.
   contact?: { name: string; phone: string; city: string | null; socials?: string[] }
+  // Step 'admin_add_business': an admin is keying in the number that will own
+  // a listing added for someone else.
+  addingBusiness?: boolean
   rating_pending?: string
   // ── Bot search flow ────────────────────────────────────────────────
   // Term typed by the user while waiting for a town ("Which town?").
