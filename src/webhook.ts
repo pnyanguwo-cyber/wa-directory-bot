@@ -2104,8 +2104,8 @@ async function handleOrderPhotoReply(
         shop,
         url,
         caption
-          ? `📸 ${caption.slice(0, 300)}\nOrder: ${row.token}`
-          : `📸 Product photo for order *${row.token}* from the buyer.`
+          ? `📸 ${caption.slice(0, 300)}\nOrder: ${orderReference(row.token)}`
+          : `📸 Product photo for order *${orderReference(row.token)}* from the buyer.`
       )
     : false
   if (!sent) {
@@ -5756,7 +5756,7 @@ async function pushOrderToSupplier(row: SupplyOrderRow, buyerPhone: string): Pro
         { id: `ask_photo_${row.id}`, title: '📸 Ask for photo' },
       ])
       for (const [n, url] of photos.entries()) {
-        await sendWhatsAppImage(digits, url, `📸 Buyer photo ${n + 1}/${photos.length} · ${row.token}`)
+        await sendWhatsAppImage(digits, url, `📸 Buyer photo ${n + 1}/${photos.length} · ${orderReference(row.token)}`)
       }
       await bumpOrderTrace(row.id, { event: 'push-dm', at: new Date().toISOString() })
       if (photos.length) {
@@ -5767,10 +5767,13 @@ async function pushOrderToSupplier(row: SupplyOrderRow, buyerPhone: string): Pro
       // window/escalation failure — fall through to the silent path below
     }
   }
+  // Outside the 24h window only an approved template can open the chat.
+  // "New order on WA Directory" takes two body vars: the shop name and the
+  // order reference (`ORD-<token>`) it tells them to reply *orders* for.
   const tpl = process.env.WHATSAPP_TEMPLATE_ORDER
   if (tpl && !active) {
     try {
-      await sendWhatsAppTemplate(digits, tpl, [row.biz_name, shortUrl])
+      await sendWhatsAppTemplate(digits, tpl, [row.biz_name, orderReference(row.token)])
       await bumpOrderTrace(row.id, { event: 'push-template', at: new Date().toISOString() })
       return true
     } catch {
@@ -5779,6 +5782,12 @@ async function pushOrderToSupplier(row: SupplyOrderRow, buyerPhone: string): Pro
   }
   await bumpOrderTrace(row.id, { event: 'push-skip', reason: 'inactive' })
   return false
+}
+
+// Shops know an order by the reference the template showed them (ORD-XXXXXX),
+// so every supplier-facing screen uses this same spelling.
+function orderReference(token: string): string {
+  return `ORD-${String(token || '').toUpperCase()}`
 }
 
 async function bumpOrderTrace(id: number, event: Record<string, unknown>) {
@@ -6070,7 +6079,7 @@ async function handleContactConsent(from: string, yes: boolean, orderId: number)
     if (shop) {
       await sendWhatsAppMessage(
         shop,
-        `🚫 The buyer for order *${row.token}* chose not to share their number. You can still send them a message here and I will pass it on.`
+        `🚫 The buyer for order *${orderReference(row.token)}* chose not to share their number. You can still send them a message here and I will pass it on.`
       )
     }
     return
@@ -6081,7 +6090,7 @@ async function handleContactConsent(from: string, yes: boolean, orderId: number)
   if (shop) {
     await sendWhatsAppMessage(
       shop,
-      `📱 The buyer for order *${row.token}* shared their number: +${buyer}\nSay hi and lock in pickup or delivery.`
+      `📱 The buyer for order *${orderReference(row.token)}* shared their number: +${buyer}\nSay hi and lock in pickup or delivery.`
     )
   }
 }
@@ -6267,7 +6276,7 @@ async function sendSupplierOrders(from: string, session: ChatSession | null) {
     const photoCount = orderPhotoUrls(r).length
     const contact = buyerContactState(r)
     lines.push(
-      `*${r.token}* · ${contact === 'shared' && r.buyer_phone ? '+' + digitsOnly(r.buyer_phone) : '🔒 buyer number private'}`
+      `*${orderReference(r.token)}* · ${contact === 'shared' && r.buyer_phone ? '+' + digitsOnly(r.buyer_phone) : '🔒 buyer number private'}`
     )
     lines.push(`↳ ${summary}`)
     const bits = [
@@ -6288,15 +6297,15 @@ async function sendSupplierOrders(from: string, session: ChatSession | null) {
   await sendInteractiveButtons(
     from,
     'Tap to confirm an order - the buyer is notified instantly.',
-    allRows.slice(0, 3).map(r => ({ id: `oclaim_${r.id}`, title: `✅ ${r.token}` }))
+    allRows.slice(0, 3).map(r => ({ id: `oclaim_${r.id}`, title: `✅ ${orderReference(r.token)}` }))
   )
   const photoRows = allRows.slice(0, 3).filter(r => orderPhotoUrls(r).length)
   if (photoRows.length) {
     await sendWhatsAppMessage(
       from,
-      `📸 See the buyer's photos: reply */photos ${photoRows[0].token}*` +
+      `📸 See the buyer's photos: reply */photos ${orderReference(photoRows[0].token)}*` +
         (photoRows.length > 1
-          ? `\nOther orders with photos: ${photoRows.slice(1).map(r => `*${r.token}*`).join(', ')}`
+          ? `\nOther orders with photos: ${photoRows.slice(1).map(r => `*${orderReference(r.token)}*`).join(', ')}`
           : '')
     )
   }
@@ -6320,16 +6329,16 @@ async function sendOrderPhotos(from: string, tokenArg: string) {
   if (token) {
     const row = await getOrderByToken(token)
     if (!row || !row.biz_id || !bizIds.includes(row.biz_id)) {
-      await sendWhatsAppMessage(from, `I can't find order *${token}* on your shop.`)
+      await sendWhatsAppMessage(from, `I can't find order *${orderReference(token)}* on your shop.`)
       return
     }
     const photos = orderPhotoUrls(row)
     if (!photos.length) {
-      await sendWhatsAppMessage(from, `Order *${row.token}* has no buyer photos.`)
+      await sendWhatsAppMessage(from, `Order *${orderReference(row.token)}* has no buyer photos.`)
       return
     }
     for (const [n, url] of photos.entries()) {
-      await sendWhatsAppImage(from, url, `📸 ${row.biz_name} · ${row.token} · photo ${n + 1}/${photos.length}`)
+      await sendWhatsAppImage(from, url, `📸 ${row.biz_name} · ${orderReference(row.token)} · photo ${n + 1}/${photos.length}`)
     }
     return
   }
@@ -6346,7 +6355,7 @@ async function sendOrderPhotos(from: string, tokenArg: string) {
       from,
       [
         '📸 Which order? Reply */photos CODE*:',
-        ...withPhotos.map(r => `• *${r.token}* - ${orderPhotoUrls(r).length} photo${orderPhotoUrls(r).length === 1 ? '' : 's'}`),
+        ...withPhotos.map(r => `• *${orderReference(r.token)}* - ${orderPhotoUrls(r).length} photo${orderPhotoUrls(r).length === 1 ? '' : 's'}`),
       ].join('\n')
     )
     return
@@ -7181,6 +7190,20 @@ export async function POST(request: Request) {
     const changes = entry?.changes?.[0]
     const value = changes?.value
 
+    // Delivery receipts (sent → delivered → read, or failed with a reason) are
+    // the only proof an outbound message reached the phone — Meta accepts a
+    // send even when the recipient never gets it. Log them so a silent failure
+    // is diagnosable instead of invisible.
+    if (Array.isArray(value?.statuses)) {
+      for (const st of value.statuses) {
+        const err = st?.errors?.[0]
+        console.log(
+          `[delivery] ${st?.id || '?'} -> ${st?.status || '?'}${err ? ` (${err.code}: ${err.title || err.message || ''})` : ''}`
+        )
+      }
+      return new Response(JSON.stringify({ status: 'ok' }), { status: 200, headers: { 'content-type': 'application/json' } })
+    }
+
     if (!value?.messages) {
       return new Response(JSON.stringify({ status: 'ok' }), { status: 200, headers: { 'content-type': 'application/json' } })
     }
@@ -7469,7 +7492,8 @@ export async function POST(request: Request) {
         // Buyer photos on an order. Slash form, or `photos CODE`, so a plain
         // "photos" search still reaches photographers.
         const photosCmd =
-          lower.match(/^\/photos(?:\s+([a-z0-9]{4,8}))?$/) || lower.match(/^photos\s+([a-z0-9]{4,8})$/)
+          lower.match(/^\/photos(?:\s+(?:ord-)?([a-z0-9]{4,8}))?$/) ||
+          lower.match(/^photos\s+(?:ord-)?([a-z0-9]{4,8})$/)
         if (photosCmd) {
           await sendOrderPhotos(from, photosCmd[1] || '')
           continue
