@@ -1,6 +1,7 @@
 import { zimbabweCities } from '@wa-directory/shared'
 import { categories as staticCategories } from '@wa-directory/shared'
 import { dedupeCategories } from '@wa-directory/shared'
+import { categoryDecision } from '@wa-directory/shared'
 
 // WhatsApp listing-intake parser: turns any message (single line, labeled
 // lines, or a full paragraph) into field updates plus a living form card.
@@ -20,6 +21,10 @@ export interface ListingFormState {
   address?: string
   description?: string
   whole_country?: boolean
+  // The owner's own words when the category could not be applied with
+  // certainty. Sent with the listing so a category request reaches an admin;
+  // the listing's category is only a placeholder until they decide.
+  requested_category?: string
   // Public logo URL queued from a photo the user sent while filling the
   // form (uploaded to the logos bucket by the bot, attached at publish).
   logo?: string
@@ -43,54 +48,14 @@ export function findListingArea(city: string, text: string): string | null {
   return null
 }
 
-// Static category hints (DB approval is enforced again inside
-// lib/listing-create.ts — these are just parsing hints).
-interface CatHint {
-  name: string
-  haystack: string
-}
-
-const CATS: CatHint[] = staticCategories.map(c => {
-  const kw = (c as { keywords?: string[] }).keywords
-  const words = [
-    c.name.toLowerCase(),
-    ...c.name.toLowerCase().split(/\s*&\s*|\s+/),
-    ...(kw ?? []),
-  ]
-  return { name: c.name, haystack: ' ' + words.join(' ') + ' ' }
-})
-
-function guessCategory(text: string): string | null {
+// A typed category becomes a listing category only when the intent is
+// unambiguous (same words, one typo, or filler removed). Anything else keeps
+// the owner's wording in `requested` and files a category request, so an admin
+// decides instead of the listing quietly landing under a guess.
+function decideCategory(text: string): { category: string; requested: string; applied: string } | null {
   const lower = text.toLowerCase().trim().replace(/[^a-z0-9& ]+/g, ' ')
   if (!lower || lower.length > 60) return null
-  for (const c of CATS) {
-    const first = c.name.toLowerCase()
-    if (first === lower) return c.name
-  }
-  const words = lower.split(/\s+/).filter(Boolean)
-  for (const w of words) {
-    if (w.length < 4) continue
-    for (const c of CATS) {
-      if (c.haystack.includes(' ' + w + ' ')) return c.name
-    }
-  }
-  const fallback = manualCategory(lower)
-  return fallback ? fallback : null
-}
-
-// Phrases like "flower seller" or "screen printing" don't hit the database
-// keywords; a coarser substring map catches them.
-const EXTRA_HINTS: { hint: string; cat: string }[] = []
-for (const c of staticCategories) {
-  const tokens = (c.name.toLowerCase().split(/\s*&\s*|\s+/)).filter(s => s.length >= 4)
-  for (const t of tokens) EXTRA_HINTS.push({ hint: t, cat: c.name })
-}
-
-function manualCategory(lower: string): string | null {
-  for (const e of EXTRA_HINTS) {
-    if (lower.includes(e.hint)) return e.cat
-  }
-  return null
+  return categoryDecision(text, staticCategories)
 }
 
 const PHONE_RE = /(?:\+?263|0)\s?7[\d\s.\-]{8,11}(?!\d)/
@@ -159,17 +124,24 @@ function setCtxField(ctx: Ctx, field: string, value: string): boolean {
       const parts = value.split(/\s*[/&,]\s*/).filter(Boolean)
       let any = false
       const cats = s.categories ? [...s.categories] : []
+      const requested: string[] = s.requested_category ? [s.requested_category] : []
       for (const part of parts) {
-        const cat = guessCategory(part)
-        if (!cat) continue
+        const decision = decideCategory(part)
+        if (!decision) continue
+        const { category: cat, requested: words } = decision
         // Case-insensitive check before pushing
         if (!cats.some(c => c.toLowerCase() === cat.toLowerCase()) && cats.length < 4) {
           cats.push(cat)
           any = true
         }
+        if (words && !requested.some(r => r.toLowerCase() === words.toLowerCase())) {
+          requested.push(words)
+          any = true
+        }
       }
       if (any) {
         s.categories = dedupeCategories(cats)
+        if (requested.length) s.requested_category = requested.join(', ').slice(0, 120)
       }
       return any
     }
@@ -410,18 +382,28 @@ export function parseListingMessage(
     }
 
     if (rem) {
-      const cat = guessCategory(rem)
-      if (cat) {
+      const decision = decideCategory(rem)
+      if (decision) {
+        const cat = decision.category
         const cats = patch.categories ? [...patch.categories] : []
         if (!cats.includes(cat) && cats.length < 4) {
           cats.push(cat)
           patch.categories = cats
           filledCount += 1
         }
-        // Whatever preceded the category is still useful as a name/description
-        // candidate ("Job Moyo Hardware" contains "Hardware").
-        leftover.push(rem.replace(new RegExp(cat, 'ig'), ' ').replace(/\s+/g, ' ').trim())
-        rem = ''
+        if (decision.applied === 'unresolved') {
+          // An uncertain category is consumed as a request rather than left in
+          // the leftovers, where it would be mistaken for the business name.
+          patch.requested_category = [patch.requested_category, decision.requested]
+            .filter(Boolean)
+            .join(', ')
+          rem = ''
+        } else {
+          // Whatever preceded the category is still useful as a name/description
+          // candidate ("Job Moyo Hardware" contains "Hardware").
+          leftover.push(rem.replace(new RegExp(cat, 'ig'), ' ').replace(/\s+/g, ' ').trim())
+          rem = ''
+        }
       }
     } else {
       continue
@@ -489,11 +471,14 @@ function fieldLines(state: ListingFormState, senderPhone: string): string[] {
   const phoneOk = !!state.phone && state.phone.replace(/\D/g, '').length >= 9
   push(!!state.name, 'Name', state.name || '', 'missing - send the business name')
   push(
-    !!state.categories?.length,
+    !!(state.categories?.length || state.requested_category),
     'Category',
     state.categories?.join(', ') || '',
     "missing - e.g. Salon, Bakery, Building Materials…"
   )
+  if (state.requested_category) {
+    lines.push(`📝 Category you described: ${state.requested_category} (our team confirms this)`)
+  }
   push(
     !!(state.city || state.whole_country),
     'City',
@@ -633,7 +618,9 @@ export const LIST_WIZARD_STEPS: WizardStep[] = [
 
 export function wizardStepAnswered(state: ListingFormState, key: WizardStep['key']): boolean {
   if (key === 'logo') return !!state.logo
-  if (key === 'categories') return !!state.categories?.length
+  // A category under admin review still answers the question: the listing can
+  // be published, with the request deciding the final category.
+  if (key === 'categories') return !!(state.categories?.length || state.requested_category)
   if (key === 'phone') return !!state.phone && state.phone.replace(/\D/g, '').length >= 9
   if (key === 'city') return !!(state.city || state.whole_country)
   if (key === 'area') {

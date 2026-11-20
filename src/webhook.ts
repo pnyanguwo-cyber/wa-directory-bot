@@ -105,6 +105,13 @@ import { zimbabweCities } from '@wa-directory/shared'
 import { validatePhone } from '@wa-directory/shared'
 import { getApprovedCategories, getApprovedAreas, getApprovedAreaNames, matchCategoryAgainst, matchCategoryLearned, findCityLearned, findAreaLearned } from '@wa-directory/shared'
 import { autoRequestUnapprovedFeatures, adminRequestNotice } from '@wa-directory/shared'
+import {
+  listPendingFeatureRequests,
+  countPendingFeatureRequests,
+  renderFeatureRequestList,
+  approveFeatureRequestById,
+  rejectFeatureRequestById,
+} from '@wa-directory/shared'
 import { searchPayBusinesses, type PayBusiness } from '@wa-directory/shared'
 import { createListingPayment, paymentAmountFor } from '@wa-directory/shared'
 import { normalizeEcoCashPhone, initiateEcoCashPayment, logPaymentEvent, type PaymentAdapters } from '@wa-directory/shared'
@@ -4197,6 +4204,48 @@ async function handleAdminCommand(from: string, text: string): Promise<boolean> 
     return true
   }
 
+  // Category / location requests. The admin is often on the road with only
+  // WhatsApp, so approving or rejecting must not require the web panel.
+  if (/^(requests?|reqs|feature requests?)$/.test(lower)) {
+    const rows = await listPendingFeatureRequests(10)
+    const total = await countPendingFeatureRequests()
+    if (!rows.length) {
+      await sendWhatsAppMessage(from, '🗂 No pending category or location requests. ✅')
+      return true
+    }
+    await saveSession(from, 'admin_requests', { pendingReqs: rows.map(r => r.id) } as ChatSessionData)
+    await sendWhatsAppMessage(from, renderFeatureRequestList(rows, total))
+    return true
+  }
+
+  const reqAction = clean.match(/^(approve|reject)\s+req(?:uest)?\s+(\d{1,2})(?:\s+([\s\S]+))?$/i)
+  if (reqAction) {
+    const op = reqAction[1].toLowerCase()
+    const idx = Number(reqAction[2]) - 1
+    const corrected = (reqAction[3] || '').trim()
+    const sess = await getSession(from)
+    const ids = sess?.data.pendingReqs || []
+    if (idx < 0 || idx >= ids.length) {
+      await sendWhatsAppMessage(from, 'Run *requests* first, then reply *approve req 1* with a list number.')
+      return true
+    }
+    const result = op === 'approve'
+      ? await approveFeatureRequestById(ids[idx], corrected)
+      : await rejectFeatureRequestById(ids[idx])
+    if (!result.ok) {
+      await sendWhatsAppMessage(from, `⚠️ ${result.error || 'Could not update that request.'}`)
+      return true
+    }
+    const remaining = ids.filter((id: string) => id !== ids[idx])
+    await saveSession(from, 'admin_requests', { pendingReqs: remaining } as ChatSessionData)
+    const verb = op === 'approve' ? 'approved' : 'rejected'
+    await sendWhatsAppMessage(
+      from,
+      `${op === 'approve' ? '✅' : '✖'} *${result.name}* (${result.type}) ${verb}. ${remaining.length} left in this list.\nSend *requests* for the next page.`
+    )
+    return true
+  }
+
   if (lower === 'pending') {
     const bus = await listUnverifiedBusinesses(10)
     if (!bus.length) {
@@ -7056,6 +7105,9 @@ async function publishBusiness(from: string, session: ChatSession, msgId?: strin
     countryCode,
     phone,
     categories: data.categories && data.categories.length ? data.categories : [data.category || 'Other'],
+    // The owner's own wording travels with the listing so an ambiguous
+    // category becomes an admin request, not a silent guess.
+    requestedCategory: typeof data.list?.requested_category === 'string' ? data.list.requested_category : undefined,
     city: wholeCountry ? '*' : city || undefined,
     pendingCity: !wholeCountry && !!city && !zimbabweCities.some(c => c.name === city),
     areas: city ? [area].filter(Boolean) : [],

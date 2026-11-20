@@ -2,6 +2,9 @@
 import type { ResultCard } from '@wa-directory/shared'
 
 export interface ChatSessionData {
+  // WhatsApp admin: the ids behind the last `requests` list, so `approve req 2`
+  // acts on what the admin actually saw.
+  pendingReqs?: string[]
   name?: string
   whatsapp_username?: string
   phone?: string
