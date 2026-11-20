@@ -11,8 +11,7 @@
     }
   },
   "scripts": {
-    "build": "tsc --project .",
-    "prepare": "tsc --project ."
+    "build": "tsc --project ."
   },
   "dependencies": {
     "@supabase/supabase-js": "^2.45.0",
