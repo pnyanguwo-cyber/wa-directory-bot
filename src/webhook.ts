@@ -74,6 +74,7 @@ import {
 import { getSupabase } from '@wa-directory/shared'
 import { upsertBotContact, markBotContactOptOut, setBotContactOptIn, hasSeenContact, sweepIdleNudges, getBotContactName } from '../lib/bot-contacts.js'
 import { getBotSetting, setBotSetting } from '@wa-directory/shared'
+import { getAiLimitStatus, renderAiLimitNotice } from '@wa-directory/shared'
 import { createListing } from '@wa-directory/shared'
 import { uploadLogoImage } from '@wa-directory/shared'
 import { fetchWhatsAppMedia, perceiveMedia, mediaRateOk, type MediaKind, type MediaSense } from '../lib/bot-sense.js'
@@ -7364,6 +7365,26 @@ async function sendConfirmation(from: string, data: ChatSessionData) {
   await sendWhatsAppMessage(from, lines.join('\n'))
 }
 
+// A limit notice at most once per six hours per number: a customer mid-flow
+// should hear when AI comes back, not on every message.
+const AI_NOTICE_TTL_MS = 6 * 60 * 60 * 1000
+
+async function maybeNoticeAiLimit(from: string): Promise<void> {
+  if (!from) return
+  const key = `ai_notice:${digitsOnly(from)}`
+  const last = await getBotSetting(key)
+  if (last) {
+    const at = new Date(last).getTime()
+    if (Number.isFinite(at) && Date.now() - at < AI_NOTICE_TTL_MS) return
+  }
+
+  const status = await getAiLimitStatus()
+  if (!status.limited || !status.resetAt) return
+
+  await sendWhatsAppMessage(from, renderAiLimitNotice(status.resetAt))
+  await setBotSetting(key, new Date().toISOString())
+}
+
 export async function GET(request: Request) {
   const { searchParams } = new URL(request.url)
   const mode = searchParams.get('hub.mode')
@@ -7464,6 +7485,10 @@ export async function POST(request: Request) {
         console.log(
           `WhatsApp message from ${from}: ${text || `[${action || (mediaKind === 'audio' ? 'voice note' : mediaKind === 'image' ? 'photo' : 'location')}]`}`
         )
+
+        // AI out of quota: one short notice with the exact time it is back,
+        // sent alongside the normal reply so nothing else is delayed.
+        maybeNoticeAiLimit(from).catch(() => {})
 
         // Word-for-word inbound record (fail-open) for the admin transcript view.
         logBotMessage(
