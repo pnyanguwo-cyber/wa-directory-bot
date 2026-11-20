@@ -4,5 +4,6 @@
       "path": "/api/cron/daily-summary",
       "schedule": "0 18 * * *"
     }
-  ]
+  ],
+  "installCommand": "npm ci --no-audit --no-fund"
 }
