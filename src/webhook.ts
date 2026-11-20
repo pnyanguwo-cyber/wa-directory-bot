@@ -77,6 +77,7 @@ import { getBotSetting, setBotSetting } from '@wa-directory/shared'
 import { createListing } from '@wa-directory/shared'
 import { uploadLogoImage } from '@wa-directory/shared'
 import { fetchWhatsAppMedia, perceiveMedia, mediaRateOk, type MediaKind, type MediaSense } from '../lib/bot-sense.js'
+import { semanticPhotoHint, type SemanticHint } from '../lib/semantic-search.js'
 import {
   parseListingMessage,
   renderListingForm,
@@ -2130,6 +2131,53 @@ async function handleOrderPhotoReply(
   await sendWhatsAppMessage(from, `✅ Photo sent to *${row.biz_name}*.`, mediaMsgId)
 }
 
+// Vector recall for photos: when the vision description lands near shelf items,
+// answer from the index instead of asking "Which town?" — the picture already
+// said what they want, and products are matched nationwide on the webapp too.
+// Returns false when nothing clears the similarity floor so the caller keeps
+// the ordinary keyword flow.
+async function sendSemanticPhotoResults(
+  from: string,
+  hint: SemanticHint,
+  label: string,
+  replyTo?: string
+): Promise<boolean> {
+  if (hint.businessIds.length === 0) return false
+  const { data } = await getSupabase()
+    .from('businesses')
+    .select(BOT_BIZ_COLUMNS)
+    .in('id', hint.businessIds.slice(0, MAX_RESULTS))
+    .eq('verified', true)
+  const byId = new Map(((data as BotBusinessRow[]) || []).map(b => [String(b.id), b]))
+  // Index order is similarity order; a database round-trip is not.
+  const results: BotResult[] = hint.businessIds
+    .map(id => byId.get(String(id)))
+    .filter((b): b is BotBusinessRow => !!b)
+    .map(biz => ({ biz, item: hint.items.get(String(biz.id)) || null }))
+  if (results.length === 0) return false
+
+  const cards = results.map(toCard)
+  const prev = await getSession(from)
+  await saveSession(from, 'browse', {
+    ...pendingFields(prev),
+    results: cards,
+    lastScreen: 'list',
+    lastTerm: label,
+    lastCity: null,
+    nearby: false,
+    page: 0,
+  })
+  await sendWhatsAppMessage(
+    from,
+    `🔍 Closest matches to your photo — *${label}*. Nationwide, matched by what the picture shows:`,
+    replyTo
+  )
+  await sendResultsListPage(from, cards, 0, label, null, false, replyTo)
+  emitDemandSearch({ term: label, city: '', resultCount: results.length, buyer: from }).catch(() => {})
+  recordBotEvents(results.map(r => r.biz)).catch(() => {})
+  return true
+}
+
 async function handleBotMedia(
   from: string,
   session: ChatSession | null,
@@ -2268,6 +2316,16 @@ async function handleBotMedia(
       ? `You said: *${query}* - searching…`
       : `That photo looks like: *${query}* - searching…`
   await sendWhatsAppMessage(from, echo, mediaMsgId)
+
+  // Photos get one vector pass over what the model actually saw, so a picture
+  // of a handbag finds a listing called "Ladies tote" with no shared keyword.
+  // Only when that finds something is the town question skipped.
+  if (kind === 'image') {
+    const semanticText = [sense.term, sense.category, sense.description].filter(Boolean).join('. ')
+    const hint = await semanticPhotoHint(semanticText)
+    if (hint && (await sendSemanticPhotoResults(from, hint, sense.term || 'your photo', mediaMsgId))) return
+  }
+
   await dispatchSearch(from, query, { replyTo: mediaMsgId })
 }
 
