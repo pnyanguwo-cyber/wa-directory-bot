@@ -4265,8 +4265,8 @@ async function handleAdminCommand(from: string, text: string): Promise<boolean> 
     })
     lines.push(
       '',
-      'Reply *1* to approve 30 days, *verify 1 90* for custom days, or *unverify 1*.',
-      'Or skip the list: *verify Diamond tradings 30* matches by name (typo-friendly).'
+      'Reply *1* to approve (90-day trial if the owner asked for one, else 30 days), *trial 1* to start the free trial, *verify 1 90* for custom days, or *unverify 1*.',
+      'Or skip the list: *verify Diamond tradings* / *trial Diamond tradings* matches by name (typo-friendly).'
     )
     await sendWhatsAppMessage(from, lines.join('\n'))
     return true
