@@ -106,6 +106,12 @@ import { validatePhone } from '@wa-directory/shared'
 import { getApprovedCategories, getApprovedAreas, getApprovedAreaNames, matchCategoryAgainst, matchCategoryLearned, findCityLearned, findAreaLearned } from '@wa-directory/shared'
 import { autoRequestUnapprovedFeatures, adminRequestNotice } from '@wa-directory/shared'
 import {
+  sendAdminNotice,
+  pendingVerificationButtons,
+  reviewRequestButtons,
+  submissionNoticeBody,
+} from '@wa-directory/shared'
+import {
   listPendingFeatureRequests,
   countPendingFeatureRequests,
   renderFeatureRequestList,
@@ -7152,7 +7158,11 @@ async function publishBusiness(from: string, session: ChatSession, msgId?: strin
     if (newRequests.length && process.env.ADMIN_WHATSAPP) {
       const notice = adminRequestNotice(bizRow?.name || '', bizRow?.business_id || '', newRequests)
       if (notice) {
-        await sendWhatsAppMessage(process.env.ADMIN_WHATSAPP, notice).catch(() => {})
+        await sendAdminNotice(
+          process.env.ADMIN_WHATSAPP,
+          notice,
+          reviewRequestButtons(bizRow?.name || '')
+        ).catch(() => {})
       }
     }
   }
@@ -7214,18 +7224,25 @@ async function publishBusiness(from: string, session: ChatSession, msgId?: strin
   }
 
   if (ADMIN_WHATSAPP) {
-    sendWhatsAppMessage(
+    sendAdminNotice(
       ADMIN_WHATSAPP,
-      [
-        result.pendingPayment ? '🆕 NEW BUSINESS PENDING VERIFICATION' : '🚨 YELLOW PAGES SUBMISSION: VERIFY FAST',
-        '',
-        `Name: ${name}`,
-        `Category: ${result.categories.join(', ')}`,
-        `Location: ${result.city || 'Zimbabwe (whole country)'}`,
-        `Phone: ${phone}`,
-        `Approve: ${SITE_URL}/admin`,
-        result.isYellowPages ? 'Public-service listing: verify ASAP for the Emergency & Essential strip.' : '',
-      ].filter(Boolean).join('\n')
+      submissionNoticeBody({
+        title: result.pendingPayment
+          ? '🆕 NEW BUSINESS PENDING VERIFICATION'
+          : '🚨 YELLOW PAGES SUBMISSION: VERIFY FAST',
+        name,
+        code: result.businessId,
+        category: result.categories.join(', '),
+        location: result.city || '',
+        phone,
+        extra: [
+          ...(result.pendingPayment ? [`Payment: pending (${SITE_URL}/admin)`] : []),
+          ...(result.isYellowPages
+            ? ['Public-service listing: verify ASAP for the Emergency & Essential strip.']
+            : []),
+        ],
+      }),
+      pendingVerificationButtons(name)
     ).catch(() => {})
   }
 }
@@ -7572,7 +7589,9 @@ export async function POST(request: Request) {
 
         // ── Admin command suite (owner + allowlisted numbers) ───────────
         if (await isBotAdmin(from)) {
-          if (await handleAdminCommand(from, text)) {
+          // A tapped admin button carries its command in the id, so treat the
+          // tap exactly like the typed line it stands for.
+          if (await handleAdminCommand(from, text || action)) {
             continue
           }
           // A pending/verify list was the last thing on screen, so a bare
