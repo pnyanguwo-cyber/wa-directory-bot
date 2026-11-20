@@ -88,7 +88,7 @@ export interface ChatSessionData {
   // Last `pending` listing: business ids in display order for verify N.
   pendingBiz?: string[]
   // Fuzzy-match suggestions: op + day-grant carried through the pick.
-  pendingOp?: 'verify' | 'unverify'
+  pendingOp?: 'verify' | 'unverify' | 'trial'
   pendingDays?: number
   // Pending product photo (item_photo flow): uploaded URL awaiting name+price.
   pendingItemImage?: string

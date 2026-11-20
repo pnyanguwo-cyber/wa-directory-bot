@@ -4275,9 +4275,12 @@ async function handleAdminCommand(from: string, text: string): Promise<boolean> 
   // verify/unverify — a number picks from the pending list; anything else is
   // a fuzzy business-name match with an optional day-grant in the same line:
   //   verify Diamond tradings 30   ·   verify 1   ·   unverify 2
-  const verifyCmd = clean.match(/^(verify|unverify)(?:\s+([\s\S]+))?$/i)
+  //   trial Diamond tradings   ·   unverify 2
+  const verifyCmd = clean.match(/^(verify|unverify|trial)(?:\s+([\s\S]+))?$/i)
   if (verifyCmd) {
-    let op: 'verify' | 'unverify' = verifyCmd[1].toLowerCase() === 'verify' ? 'verify' : 'unverify'
+    const opArg = verifyCmd[1].toLowerCase()
+    let op: 'verify' | 'unverify' | 'trial' =
+      opArg === 'verify' ? 'verify' : opArg === 'trial' ? 'trial' : 'unverify'
     const arg = (verifyCmd[2] || '').trim()
     if (!arg) {
       await sendWhatsAppMessage(
@@ -4356,6 +4359,38 @@ async function handleAdminCommand(from: string, text: string): Promise<boolean> 
 
     if (!biz) {
       await sendWhatsAppMessage(from, 'That business was not found - run *pending* again.')
+      return true
+    }
+
+    if (op === 'trial') {
+      // Start the full 90-day free trial now, whether or not the owner asked
+      // for it. The trial clock is written here (trial_expires_at), so the
+      // 7-day/3-day reminders and the expiry cron take over.
+      const trial = await startTrialForBusiness(biz.id, { adminOverride: true })
+      if (!trial.ok || !trial.trialExpiresAt) {
+        await sendWhatsAppMessage(
+          from,
+          `❌ Could not start the free trial for *${biz.name}*: ${trial.error || 'unknown error'}`
+        )
+        return true
+      }
+      const until = trial.trialExpiresAt.slice(0, 10)
+      await sendWhatsAppMessage(
+        from,
+        `✅ *${biz.name}* approved - ${TRIAL_PLAN_LABEL} started (until ${until}, ${TRIAL_DAYS} days).`
+      )
+      if (biz.phone) {
+        await notifyBusinessLive(biz)
+        await sendWhatsAppMessage(
+          biz.phone,
+          [
+            `🆓 *${TRIAL_PLAN_LABEL} active*`,
+            '',
+            `Your free trial runs until *${until}* (${TRIAL_DAYS} days). No payment is needed.`,
+            'We will remind you before it ends.',
+          ].join('\n')
+        )
+      }
       return true
     }
 
@@ -7593,7 +7628,7 @@ export async function POST(request: Request) {
           // tap exactly like the typed line it stands for. Only our own admin
           // button ids are routed this way: other taps (menus, bids) must not
           // collide with commands like "reset" or "hold".
-          const adminTap = /^(?:verify|unverify|pending|requests|reqs|approve req|reject req)\b/i.test(
+          const adminTap = /^(?:verify|unverify|trial|pending|requests|reqs|approve req|reject req)\b/i.test(
             action
           )
             ? action
@@ -7606,7 +7641,8 @@ export async function POST(request: Request) {
           // the generic handler to answer with "that option has expired".
           const adminPick = text.trim().match(/^([1-9][0-9]?)$/)
           if (session?.step === 'admin_pending' && adminPick) {
-            const op = session.data.pendingOp === 'unverify' ? 'unverify' : 'verify'
+            const pendingOp = session.data.pendingOp
+            const op = pendingOp === 'unverify' || pendingOp === 'trial' ? pendingOp : 'verify'
             if (await handleAdminCommand(from, `${op} ${adminPick[1]}`)) {
               continue
             }
