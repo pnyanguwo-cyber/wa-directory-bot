@@ -16,7 +16,7 @@
   },
   "dependencies": {
     "@supabase/supabase-js": "^2.45.0",
-    "@wa-directory/shared": "github:pnyanguwo-cyber/wa-directory-shared#69d1a9643b2ccf6e22de7786426c7563aa60772d"
+    "@wa-directory/shared": "github:pnyanguwo-cyber/wa-directory-shared#d1f8688d2d7a9aafabc2d9b6701501334b085dd1"
   },
   "devDependencies": {
     "@types/node": "^20.14.0",
@@ -31,6 +31,7 @@
     "github:pnyanguwo-cyber/wa-directory-shared#cd917f2ecbb4c6ae6aadc005e877dec75a1d2002": true,
     "github:pnyanguwo-cyber/wa-directory-shared#f1fb2d3475d34aa201c21c697a0142018b0eaccb": true,
     "github:pnyanguwo-cyber/wa-directory-shared#d9b0bad0a169024e31215810e00877d6ada65347": true,
-    "github:pnyanguwo-cyber/wa-directory-shared#69d1a9643b2ccf6e22de7786426c7563aa60772d": true
+    "github:pnyanguwo-cyber/wa-directory-shared#69d1a9643b2ccf6e22de7786426c7563aa60772d": true,
+    "github:pnyanguwo-cyber/wa-directory-shared#d1f8688d2d7a9aafabc2d9b6701501334b085dd1": true
   }
 }
