@@ -119,6 +119,7 @@ import {
   renderFeatureRequestList,
   approveFeatureRequestById,
   rejectFeatureRequestById,
+  connectFeatureRequestToCategory,
 } from '@wa-directory/shared'
 import { searchPayBusinesses, type PayBusiness } from '@wa-directory/shared'
 import { createListingPayment, paymentAmountFor } from '@wa-directory/shared'
@@ -4227,6 +4228,58 @@ async function handleAdminCommand(from: string, text: string): Promise<boolean> 
     return true
   }
 
+  // "Connect to": the requested wording is the same thing as a category we
+  // already have. Files the listing there, learns the alias for every future
+  // request, and closes the request without adding a near-duplicate category.
+  const reqConnect = clean.match(/^connect\s+(?:req(?:uest)?\s+)?(\d{1,2})(?:\s+(?:to|as)\s+|\s+)([\s\S]+)$/i)
+  if (reqConnect) {
+    const idx = Number(reqConnect[1]) - 1
+    const target = (reqConnect[2] || '').trim()
+    const sess = await getSession(from)
+    const ids = sess?.data.pendingCategoryReqs || sess?.data.pendingReqs || []
+    if (idx < 0 || idx >= ids.length) {
+      await sendWhatsAppMessage(from, 'Run *requests* first, then reply *connect req 1 <existing category>* with a list number.')
+      return true
+    }
+    const result = await connectFeatureRequestToCategory(ids[idx], target)
+    if (!result.ok) {
+      await sendWhatsAppMessage(from, `⚠️ ${result.error || 'Could not connect that request.'}`)
+      return true
+    }
+    const remaining = ids.filter((id: string) => id !== ids[idx])
+    await saveSession(from, 'admin_requests', { pendingReqs: remaining, pendingCategoryReqs: remaining } as ChatSessionData)
+    await sendWhatsAppMessage(
+      from,
+      `🔗 *${result.alias}* → *${result.name}*. Filed under the existing category and remembered for future listings. ${remaining.length} left in this list.`
+    )
+    return true
+  }
+
+  // "Connect to" tapped with no category yet: show only the category requests
+  // and spell out the one-line form, instead of guessing which category.
+  if (/^connect(?:\s+req(?:uest)?)?$/.test(lower)) {
+    const rows = (await listPendingFeatureRequests(20)).filter(r => r.type === 'category')
+    if (!rows.length) {
+      await sendWhatsAppMessage(from, '🗂 No pending *category* requests to connect. Revenue city/area requests are on *requests*.')
+      return true
+    }
+    await saveSession(from, 'admin_requests', {
+      pendingReqs: rows.map(r => r.id),
+      pendingCategoryReqs: rows.map(r => r.id),
+    } as ChatSessionData)
+    const lines = ['🔗 *Connect a requested category*', '']
+    rows.forEach((r, i) => {
+      lines.push(`${i + 1}. *${r.name}* · requested by ${r.business_name}`)
+    })
+    lines.push(
+      '',
+      'Reply *connect req 1 <existing category>*, e.g. *connect req 1 Hardware*.',
+      'Type *requests* to see the full list, or *approve req 1* if it really is a new category.'
+    )
+    await sendWhatsAppMessage(from, lines.join('\n'))
+    return true
+  }
+
   const reqAction = clean.match(/^(approve|reject)\s+req(?:uest)?\s+(\d{1,2})(?:\s+([\s\S]+))?$/i)
   if (reqAction) {
     const op = reqAction[1].toLowerCase()
@@ -7679,7 +7732,7 @@ export async function POST(request: Request) {
           // tap exactly like the typed line it stands for. Only our own admin
           // button ids are routed this way: other taps (menus, bids) must not
           // collide with commands like "reset" or "hold".
-          const adminTap = /^(?:verify|unverify|trial|pending|requests|reqs|approve req|reject req)\b/i.test(
+          const adminTap = /^(?:verify|unverify|trial|pending|requests|reqs|approve req|reject req|connect req)\b/i.test(
             action
           )
             ? action
@@ -7800,18 +7853,39 @@ export async function POST(request: Request) {
         // Checked before the pivot/shelved-draft matchers below: an active
         // registration owns every text reply, and a stale session row from an
         // earlier flow must not hijack words like "help me".
+        // Pick up a flow that an earlier direction change shelved (the draft
+        // lives in the session row, which may be the 'idle' placeholder).
+        // A resume request with nothing to resume answers plainly - it used to
+        // fall through to search, so *resume* looked broken.
+        const resumeAsk = /^(?:resume|continue|pick ?up|carry on)(?:\s+(?:my|the)?\s*(?:draft|registration|listing|form|order|where i left(?: off)?))?[.!]*$/.test(
+          lower.trim()
+        )
+
         const convState = await getConversationState(from)
         if (convState && convState.state.startsWith('REGISTRATION_')) {
+          // "resume" is not an answer to a registration question. Say where
+          // the person is instead of saving "resume" as their business name.
+          if (resumeAsk) {
+            await sendWhatsAppMessage(
+              from,
+              '📝 Your registration is still open - answer the last question above to carry on, or send *cancel* to stop.\n\nType *menu* for everything else.'
+            )
+            continue
+          }
           await handleRegistrationMessage(from, text, convState.context)
           continue
         }
 
-        // Pick up a flow that an earlier direction change shelved (the draft
-        // lives in the session row, which may be the 'idle' placeholder).
-        if (
-          /^(?:resume|continue|pick ?up|carry on)\b/.test(lower) &&
-          (await resumePaused(from, session || (await getSession(from))))
-        ) {
+        if (resumeAsk) {
+          if (await resumePaused(from, session || (await getSession(from)))) continue
+          const current = await getSession(from)
+          const staleAt = current?.data?.paused?.at
+          await sendWhatsAppMessage(
+            from,
+            staleAt
+              ? '⌛ That draft is more than 24 hours old, so I no longer have it.\n\nSend *register* to start again, or *menu* to see everything.'
+              : "Nothing to resume right now - you're not in the middle of anything.\n\nSend what you're looking for plus your town, or *menu* for the options."
+          )
           continue
         }
 

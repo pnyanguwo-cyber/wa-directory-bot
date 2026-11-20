@@ -5,6 +5,9 @@ export interface ChatSessionData {
   // WhatsApp admin: the ids behind the last `requests` list, so `approve req 2`
   // acts on what the admin actually saw.
   pendingReqs?: string[]
+  // Same ids, filtered to category requests: *connect req 1 <category>* reads
+  // from this list so a city/area number cannot be connected by mistake.
+  pendingCategoryReqs?: string[]
   name?: string
   whatsapp_username?: string
   phone?: string
@@ -232,7 +235,31 @@ export async function saveSession(phone: string, step: string, data: ChatSession
 
 export async function clearSession(phone: string) {
   try {
-    await getSupabase().from('chat_sessions').delete().eq('phone', phone)
+    const supabase = getSupabase()
+    // Ending a flow must not throw away work the person was told they could
+    // resume. A fresh shelved draft (and an admin hold) survive the clear as an
+    // idle row; anything older than the pause TTL is deleted as before.
+    const { data: row } = await supabase
+      .from('chat_sessions')
+      .select('data')
+      .eq('phone', phone)
+      .maybeSingle()
+    const paused = row?.data?.paused as PausedDraft | undefined
+    const held = row?.data?.held as ChatSessionData['held'] | undefined
+    const freshPause = paused?.step && Date.now() - Date.parse(paused.at || '') < PAUSE_TTL_MS
+    if (freshPause || held) {
+      await supabase.from('chat_sessions').upsert(
+        {
+          phone,
+          step: 'idle',
+          data: { ...(freshPause ? { paused } : {}), ...(held ? { held } : {}) },
+          updated_at: new Date().toISOString(),
+        },
+        { onConflict: 'phone' }
+      )
+      return
+    }
+    await supabase.from('chat_sessions').delete().eq('phone', phone)
   } catch (err) {
     console.error('[chat-session] clear failed:', err)
   }
