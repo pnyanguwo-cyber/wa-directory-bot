@@ -110,6 +110,7 @@ import { PLAN_CONFIG, PERSONAL_PLAN_CONFIG } from '@wa-directory/shared'
 import type { PlanType } from '@wa-directory/shared'
 import { SITE_URL } from '@wa-directory/shared'
 import { digitsOnly } from '@wa-directory/shared'
+import { searchVariants, matchesSearchTerm } from '@wa-directory/shared'
 import { listEmergencyContacts, addEmergencyContact, deleteEmergencyContact, clearEmergencyContacts, findEmergencyNear, parseEmergencyAdd, emergencyWaLink, categoryIcon, VALID_CATEGORIES } from '../lib/emergency.js'
 import {
   CHAT_OPEN_MARKER,
@@ -923,7 +924,8 @@ function bizMatchesQuery(
   category: string
 ): boolean {
   const catHit = category !== 'Other' && (b.category || []).includes(category)
-  const nameHit = lowerTerm.length >= 3 && (b.name || '').toLowerCase().includes(lowerTerm)
+  // British/American variants: "fertilizer" must still find "Fertiliser".
+  const nameHit = lowerTerm.length >= 3 && matchesSearchTerm(b.name, lowerTerm)
   return catHit || nameHit
 }
 
@@ -954,7 +956,14 @@ async function fetchMatchingItems(
   // item tier keeps up with the tokenized order matcher; single tokens
   // degrade to the old substring behavior.
   if (tokens.length >= 2) tokens.forEach(t => { req = req.ilike('name', `%${t}%`) })
-  else req = req.ilike('name', `%${term}%`)
+  else {
+    const variants = searchVariants(term)
+    if (variants.length > 0) {
+      req = req.or([term, ...variants].map(v => `name.ilike.%${v}%`).join(','))
+    } else {
+      req = req.ilike('name', `%${term}%`)
+    }
+  }
   const { data } = await req
     .order('price', { ascending: true })
     .limit(200)
@@ -5187,7 +5196,7 @@ async function sendResultsListPage(
 async function runSearchAndReply(
   from: string,
   p: ParsedQuery,
-  opts?: { replyTo?: string; aliased?: boolean; nationwideTried?: boolean; goalAskDone?: boolean }
+  opts?: { replyTo?: string; aliased?: boolean; nationwideTried?: boolean; goalAskDone?: boolean; correctedFrom?: string }
 ) {
   const supabase = getSupabase()
   const term = p.term.toLowerCase()
@@ -5266,8 +5275,47 @@ async function runSearchAndReply(
     results = tmp
   }
 
+  // Spelling rescue, Google-style: "fertilizer" must still find a listing
+  // spelled "Fertiliser" (and vice versa) instead of reporting it unavailable.
+  // Runs before the nearby-town tier so a spelling fix keeps the user's town.
+  if (results.length === 0 && term.length >= 3 && !opts?.correctedFrom) {
+    const approvedCats = await getApprovedCategories()
+    for (const variant of searchVariants(term).slice(0, 4)) {
+      const variantCategory = matchCategoryAgainst(variant, approvedCats)
+      if (scope.some(b => bizMatchesQuery(b, variant, variantCategory))) {
+        await runSearchAndReply(
+          from,
+          { term: variant, city: p.city, nationwide: p.nationwide, origin: p.origin },
+          { ...opts, correctedFrom: p.term }
+        )
+        return
+      }
+    }
+    // Products only: first variant may still name a shelf item whose
+    // business is called something else.
+    const firstVariant = searchVariants(term)[0]
+    if (firstVariant && (await fetchMatchingItems(scope.map(b => b.id), firstVariant)).size > 0) {
+      await runSearchAndReply(
+        from,
+        { term: firstVariant, city: p.city, nationwide: p.nationwide, origin: p.origin },
+        { ...opts, correctedFrom: p.term }
+      )
+      return
+    }
+  }
+
   results = results.slice(0, MAX_RESULTS)
   const termDisplay = p.term || category.toLowerCase()
+
+  // Tell the user which spelling we actually searched (only when the
+  // corrected query found something).
+  if (opts?.correctedFrom && results.length > 0) {
+    await sendWhatsAppMessage(
+      from,
+      `No results for *${opts.correctedFrom}*. Showing results for *${termDisplay}* instead.`,
+      opts.replyTo
+    )
+  }
 
   // S19 goal-word ask: the search term IS a menu word (pay / register /
   // order) AND businesses matched it — offer the two ways instead of
