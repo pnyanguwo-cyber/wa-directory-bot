@@ -13,6 +13,7 @@ import {
   sendContactCard,
   markRead,
   sendWhatsAppTemplate,
+  setOutboundLogger,
 } from '@wa-directory/shared'
 import type { InteractiveRow, InteractiveButton } from '@wa-directory/shared'
 import { monoUSD } from '@wa-directory/shared'
@@ -78,6 +79,7 @@ import { getAiLimitStatus, renderAiLimitNotice } from '@wa-directory/shared'
 import { createListing } from '@wa-directory/shared'
 import { uploadLogoImage } from '@wa-directory/shared'
 import { fetchWhatsAppMedia, perceiveMedia, mediaRateOk, type MediaKind, type MediaSense } from '../lib/bot-sense.js'
+import { renderSocialReply } from '../lib/social-intent.js'
 import { semanticPhotoHint, type SemanticHint } from '../lib/semantic-search.js'
 import {
   parseListingMessage,
@@ -490,16 +492,21 @@ function csvForChats(rows: ChatCsvRow[]): string {
   )
 }
 
-// ── Transcript-logging send wrappers (S16) ────────────────────────────────
-// Every bot send goes through one replay: the raw Cloud API call plus a
-// fire-and-forget transcript row in bot_messages. Call sites keep the old
-// names, so logging covers every flow without touching them.
+// ── Transcript logging ────────────────────────────────────────────────────
+// One hook on the shared WhatsApp module mirrors EVERY outbound message into
+// bot_messages: this bot's own replies AND the ones the shared flows send
+// directly (registration questions, verification notices). Before this, the
+// admin transcript showed the customer's answers during registration with no
+// bot questions in between.
 function logOut(to: string, kind: string, body: string) {
   logBotMessage(to, 'out', kind, body).catch(() => {})
 }
 
+setOutboundLogger((to: string, kind: string, body: string) => {
+  logBotMessage(to, 'out', kind, body).catch(() => {})
+})
+
 async function sendWhatsAppMessage(to: string, message: string, replyTo?: string) {
-  logOut(to, 'text', message)
   return sendWhatsAppText(to, message, replyTo)
 }
 
@@ -510,7 +517,9 @@ function buildPaymentAdapters(): PaymentAdapters {
   return {
     initiateEcoCashPayment,
     logPaymentEvent,
-    sendWhatsAppMessage: (phone, text) => sendWhatsAppMessage(phone, text),
+    sendWhatsAppMessage: async (phone, text) => {
+      await sendWhatsAppMessage(phone, text)
+    },
   }
 }
 
@@ -521,7 +530,6 @@ async function sendInteractiveList(
   buttonLabel = 'Choose a business',
   replyTo?: string
 ) {
-  logOut(to, 'list', `${body}\n↳ rows: ${rows.map(r => r.title).join(' | ')}`)
   return sendInteractiveListRaw(to, body, rows, buttonLabel, replyTo)
 }
 
@@ -531,27 +539,22 @@ async function sendInteractiveButtons(
   buttons: InteractiveButton[],
   replyTo?: string
 ) {
-  logOut(to, 'buttons', `${body}\n[${buttons.map(b => b.title).join(' | ')}]`)
   return sendInteractiveButtonsRaw(to, body, buttons, replyTo)
 }
 
 async function sendCtaUrl(to: string, body: string, displayText: string, url: string) {
-  logOut(to, 'cta', `${body}\n→ ${url}`)
   return sendCtaUrlRaw(to, body, displayText, url)
 }
 
 async function sendLocationRequest(to: string, body: string) {
-  logOut(to, 'location_req', body)
   return sendLocationRequestRaw(to, body)
 }
 
 async function sendReaction(to: string, messageId: string, emoji: string) {
-  logOut(to, 'reaction', `[${emoji}] on ${messageId}`)
   return sendReactionRaw(to, messageId, emoji)
 }
 
 async function sendWhatsAppDocument(to: string, filename: string, mime: string, content: string) {
-  logOut(to, 'document', `${filename} (${mime})`)
   return sendWhatsAppDocumentRaw(to, filename, mime, content)
 }
 
@@ -4473,6 +4476,39 @@ async function handleAdminCommand(from: string, text: string): Promise<boolean> 
     return true
   }
 
+  // Resend the go-live details (profile, website, portal setup, shop how-to).
+  // Useful when Meta blocked delivery the first time and the owner has since
+  // messaged again - the 24h window is now open, so free-form text lands.
+  const welcomeCmd = clean.match(/^welcome(?:\s+([\s\S]+))?$/i)
+  if (welcomeCmd) {
+    const arg = (welcomeCmd[1] || '').trim()
+    if (!arg) {
+      await sendWhatsAppMessage(from, 'Use *welcome <business name>* - e.g. *welcome Diamond tradings*.')
+      return true
+    }
+    const matches = await findBusinessesByName(arg)
+    if (!matches.length) {
+      await sendWhatsAppMessage(from, `No business close to *${arg}*. Check the spelling, or use *pending* to see the list.`)
+      return true
+    }
+    const exact = matches.find(b => bestNameSimilarity(arg, b.name) === 1)
+    const biz = exact || matches[0]
+    if (!exact && bestNameSimilarity(arg, biz.name) < 0.82) {
+      await sendWhatsAppMessage(
+        from,
+        [`🤔 Did you mean *${biz.name}*? Reply *welcome ${biz.name}* to confirm.`, '', ...matches.slice(0, 5).map((b, i) => `${i + 1}. ${b.name}`)].join('\n')
+      )
+      return true
+    }
+    if (!biz.phone) {
+      await sendWhatsAppMessage(from, `*${biz.name}* has no phone number on file, so there is nowhere to send the details.`)
+      return true
+    }
+    await notifyBusinessLive(biz)
+    await sendWhatsAppMessage(from, `📤 Go-live details re-sent to *${biz.name}* (+${digitsOnly(biz.phone)}).`)
+    return true
+  }
+
   const castCmd = clean.match(/^cast(?:\s+([\s\S]+))?$/i)
   if (castCmd) {
     const arg = (castCmd[1] || '').trim()
@@ -7594,12 +7630,27 @@ export async function POST(request: Request) {
         // sent alongside the normal reply so nothing else is delayed.
         maybeNoticeAiLimit(from).catch(() => {})
 
-        // Word-for-word inbound record (fail-open) for the admin transcript view.
+        // Word-for-word inbound record (fail-open) for the admin transcript
+        // view. Taps keep the button/list label the human actually saw (the
+        // raw id alone reads as gibberish) and photos keep Meta's media id so
+        // the portal can render the picture instead of the word "Photo".
+        const tapTitle =
+          message.interactive?.button_reply?.title ||
+          message.interactive?.list_reply?.title ||
+          ''
+        const inboundMediaId =
+          (mediaKind === 'image' && message.image?.id) ||
+          (mediaKind === 'audio' && message.audio?.id) ||
+          ''
         logBotMessage(
           from,
           'in',
           text ? 'text' : mediaKind === 'audio' ? 'voice' : mediaKind === 'image' ? 'image' : location ? 'location' : action ? 'tap' : 'other',
-          text || action || `[${mediaKind === 'audio' ? 'voice note' : mediaKind === 'image' ? 'photo' : 'location'}]`
+          text ||
+            (tapTitle ? `${tapTitle} [${action}]` : action) ||
+            (inboundMediaId
+              ? `wa-media:${inboundMediaId}${mediaKind === 'audio' ? '\n[voice note]' : ''}`
+              : `[${mediaKind === 'audio' ? 'voice note' : mediaKind === 'image' ? 'photo' : 'location'}]`)
         ).catch(() => {})
 
         // Customer base: one row per number, profile name when Meta send it.
@@ -8290,6 +8341,16 @@ export async function POST(request: Request) {
 
         if (lower === 'help') {
           await sendWhatsAppMessage(from, await helpText(from))
+          continue
+        }
+
+        // Small talk before search: "thank you", "i need help", "ok" and
+        // "bye" are answers, not queries. This sits after every flow step so a
+        // registration answer of "ok" still belongs to the form.
+        const social = renderSocialReply(text, (await getBotContactName(from)) || waName)
+        if (social) {
+          appendTranscript(from, text)
+          await sendWhatsAppMessage(from, social.kind === 'help' ? await helpText(from) : social.body)
           continue
         }
 
