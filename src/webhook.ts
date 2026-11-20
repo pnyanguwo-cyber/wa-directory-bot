@@ -7590,8 +7590,15 @@ export async function POST(request: Request) {
         // ── Admin command suite (owner + allowlisted numbers) ───────────
         if (await isBotAdmin(from)) {
           // A tapped admin button carries its command in the id, so treat the
-          // tap exactly like the typed line it stands for.
-          if (await handleAdminCommand(from, text || action)) {
+          // tap exactly like the typed line it stands for. Only our own admin
+          // button ids are routed this way: other taps (menus, bids) must not
+          // collide with commands like "reset" or "hold".
+          const adminTap = /^(?:verify|unverify|pending|requests|reqs|approve req|reject req)\b/i.test(
+            action
+          )
+            ? action
+            : ''
+          if (await handleAdminCommand(from, text || adminTap)) {
             continue
           }
           // A pending/verify list was the last thing on screen, so a bare
