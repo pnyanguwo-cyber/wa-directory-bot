@@ -3561,6 +3561,25 @@ async function handleAdminCommand(from: string, text: string): Promise<boolean> 
     return true
   }
 
+  // Waiting for the category name after *connect req* listed a single request:
+  // a plain reply is the target category, not a new command.
+  const connectPending = adminSession?.data?.connectReqId as string | undefined
+  if (connectPending && /^[a-z][a-z &,'/-]{1,40}$/i.test(clean) && !/^(?:approve|reject|connect|requests?|reqs|pending|menu|help|cancel)\b/i.test(lower)) {
+    const result = await connectFeatureRequestToCategory(connectPending, clean)
+    if (result.ok) {
+      const next: ChatSessionData = { ...(adminSession?.data || {}) }
+      delete next.connectReqId
+      await saveSession(from, 'admin_requests', next)
+      await sendWhatsAppMessage(
+        from,
+        `🔗 *${result.alias}* → *${result.name}*. Filed under the existing category and remembered for future listings.\n\nType *requests* for the rest.`
+      )
+    } else {
+      await sendWhatsAppMessage(from, `⚠️ ${result.error || 'Could not connect that request.'}`)
+    }
+    return true
+  }
+
   if (/^(?:add|list)\s+(?:a\s+)?(?:new\s+)?business$/.test(lower)) {
     await saveSession(from, 'admin_add_business', { ...(adminSession?.data || {}), addingBusiness: true })
     await sendWhatsAppMessage(
@@ -4266,6 +4285,9 @@ async function handleAdminCommand(from: string, text: string): Promise<boolean> 
     await saveSession(from, 'admin_requests', {
       pendingReqs: rows.map(r => r.id),
       pendingCategoryReqs: rows.map(r => r.id),
+      // One request only: the next plain reply is the category to connect it
+      // to, so the admin does not have to retype the number.
+      ...(rows.length === 1 ? { connectReqId: rows[0].id } : {}),
     } as ChatSessionData)
     const lines = ['🔗 *Connect a requested category*', '']
     rows.forEach((r, i) => {
@@ -4273,7 +4295,9 @@ async function handleAdminCommand(from: string, text: string): Promise<boolean> 
     })
     lines.push(
       '',
-      'Reply *connect req 1 <existing category>*, e.g. *connect req 1 Hardware*.',
+      rows.length === 1
+        ? 'Reply with the existing category, e.g. *Hardware* - or *connect req 1 Hardware*.'
+        : 'Reply *connect req 1 <existing category>*, e.g. *connect req 1 Hardware*.',
       'Type *requests* to see the full list, or *approve req 1* if it really is a new category.'
     )
     await sendWhatsAppMessage(from, lines.join('\n'))

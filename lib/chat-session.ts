@@ -8,6 +8,9 @@ export interface ChatSessionData {
   // Same ids, filtered to category requests: *connect req 1 <category>* reads
   // from this list so a city/area number cannot be connected by mistake.
   pendingCategoryReqs?: string[]
+  // Set after the connect list showed exactly one request: the next plain
+  // reply is the existing category to connect it to.
+  connectReqId?: string
   name?: string
   whatsapp_username?: string
   phone?: string
