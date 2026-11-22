@@ -47,6 +47,8 @@ import {
   type PausedDraft,
   type PendingGroup,
   type PendingOrder,
+  type ShelfBatchItem,
+  type ItemBatch,
   getCart,
   addToCart,
   updateCartQty,
@@ -78,7 +80,7 @@ import { getBotSetting, setBotSetting } from '@wa-directory/shared'
 import { getAiLimitStatus, renderAiLimitNotice } from '@wa-directory/shared'
 import { createListing } from '@wa-directory/shared'
 import { uploadLogoImage } from '@wa-directory/shared'
-import { fetchWhatsAppMedia, perceiveMedia, mediaRateOk, type MediaKind, type MediaSense } from '../lib/bot-sense.js'
+import { fetchWhatsAppMedia, perceiveMedia, mediaRateOk, recognizeShelfItems, priceFromCaption, type MediaKind, type MediaSense } from '../lib/bot-sense.js'
 import { renderSocialReply } from '../lib/social-intent.js'
 import { semanticPhotoHint, type SemanticHint } from '../lib/semantic-search.js'
 import {
@@ -1127,11 +1129,26 @@ async function startFreshSearchPrompt(from: string) {
 const MENU_ROWS = [
   { id: 'menu_needs', title: '🛒 Post a need', description: 'Write what you need — suppliers find you' },
   { id: 'menu_order', title: '🧺 Order items', description: 'Type your shopping list — sent shop by shop' },
-  { id: 'menu_register', title: '✎ Register', description: 'List your business or contact — $2/mo · 90-day free trial' },
+  { id: 'menu_register', title: '✎ Register business', description: 'List your business — quick questions, no plan choice' },
   { id: 'menu_pay', title: '$ Pay (EcoCash)', description: 'Pay or top up your subscription via EcoCash' },
   { id: 'menu_bid', title: '🏆 Bid for #1', description: 'Own the top search spot for your category' },
   { id: 'menu_help', title: '✆ Help', description: 'Search tips, account help & support' },
 ]
+
+// First hello: one question, two buttons. Buyers get the short buying guide;
+// sellers go straight into the business questions.
+function renderBuyerIntro(name?: string): string {
+  return [
+    `🛒 *Welcome${name ? ` ${name}` : ''} - buying on WA Directory*`,
+    '',
+    'Type what you need and your town, e.g. *bread harare* or *plumber masvingo*.',
+    '• Tap a shop to see items, photos and prices',
+    '• 🧺 *Order items* - send your shopping list, shop by shop',
+    '• 🛒 *Post a need* - suppliers send you quotes',
+    '',
+    'What are you looking for?',
+  ].join('\n')
+}
 
 async function sendMainMenu(from: string) {
   await clearSession(from)
@@ -1605,24 +1622,13 @@ async function resumePaused(from: string, session: ChatSession | null): Promise<
   }
 }
 
-// ✎ Register opens with the choice of what to add: a business listing
-// (90-day free trial or $2/month paid) or a paid personal contact.
+// ✎ Register goes straight into the business questions. The old
+// trial-vs-paid plan screen and the personal-contact option were removed to
+// give owners a single, short hop-in path.
 async function sendRegisterChoice(from: string) {
   await clearSession(from)
   await clearConversationState(from)
-  await sendInteractiveButtons(
-    from,
-    [
-      '✎ *Registering on WA Directory*',
-      '',
-      'Which are you adding?',
-    ].join('\n'),
-    [
-      { id: 'reg_personal', title: 'Personal contact' },
-      { id: 'reg_business', title: 'Business listing' },
-      { id: 'cancel', title: '✖ Cancel' },
-    ]
-  )
+  await startRegister(from)
 }
 
 // Personal contact intake: the whole draft is ONE message —
@@ -1935,22 +1941,36 @@ function parseItemSpec(text: string): ItemSpec | null {
 
 async function insertShelfItem(
   bizId: string,
-  spec: { name: string; price: number },
+  spec: { name: string; price: number | null; description?: string },
   imageUrl: string
 ): Promise<boolean> {
   const image_luminance = imageUrl ? await imageLuminanceFromUrl(imageUrl) : null
+  const base = {
+    business_id: bizId,
+    name: spec.name,
+    slug: slugify(spec.name) || `item-${Date.now()}`,
+    price: spec.price,
+    image_url: imageUrl,
+    image_luminance: image_luminance,
+    is_active: true,
+  }
+  const description = (spec.description || '').trim()
+  if (!description) {
+    const { error } = await getSupabase().from('business_items').insert(base)
+    return !error
+  }
+  // Description exists on newer schemas; older projects reject the column.
+  // Try with it, then fall back to the base row so a photo is never lost.
   const { error } = await getSupabase()
     .from('business_items')
-    .insert({
-      business_id: bizId,
-      name: spec.name,
-      slug: slugify(spec.name) || `item-${Date.now()}`,
-      price: spec.price,
-      image_url: imageUrl,
-      image_luminance: image_luminance,
-      is_active: true,
-    })
-  return !error
+    .insert({ ...base, description })
+  if (!error) return true
+  // Only a missing description column justifies the retry; any other error is
+  // a real save failure and must not be retried blindly.
+  if (!/description/i.test(error.message || '')) return false
+  const { error: retry } = await getSupabase().from('business_items').insert(base)
+  if (!retry) console.warn(`[shelf] description column unavailable; saved ${spec.name} without it`)
+  return !retry
 }
 
 // One live shop → save the photo and ask for name+price (caption may carry
@@ -2051,6 +2071,246 @@ async function handleItemSpecText(from: string, session: ChatSession, text: stri
     response += `\n\n📝 *Details:*\n> ${spec.description}`
   }
   await sendWhatsAppMessage(from, response)
+}
+
+// ── Seller shelf batch: up to 5 photos, recognised, then priced one by one ──
+// A seller stocking a live shop can send images faster than the old
+// one-photo-per-item flow allowed. Photos are recognised as they arrive; once
+// the seller is done (or 5 are in), the bot asks "how much is the bed?" for
+// every item that did not already carry a $ price. Numeric answers are prices
+// even without a $ ("50", "10 usd", "$50", "50$"); any other answer is kept
+// as the item's description.
+
+const SHELF_BATCH_MAX = 5
+
+function normaliseMoney(raw: string): number | null {
+  const s = raw.replace(/\s/g, '')
+  if (!s) return null
+  const cleaned = /^\d{1,3}(?:,\d{3})+(?:\.\d{1,2})?$/.test(s)
+    ? s.replace(/,/g, '')
+    : s.replace(',', '.')
+  const n = Number(cleaned)
+  return Number.isFinite(n) && n > 0 ? n : null
+}
+
+/** The seller's answer to an explicit price question. Numbers in any common
+ * shape are prices; a normal sentence is a description; skip means no price. */
+function parsePriceReply(text: string):
+  | { kind: 'price'; value: number }
+  | { kind: 'skip' }
+  | { kind: 'description'; text: string } {
+  const t = text.trim()
+  if (/^(?:skip|no|none|no price|n\/?a|free|not selling)$/i.test(t)) return { kind: 'skip' }
+  const m = t.match(/^(?:usd|us\$|\$)?\s*([\d.,]+)\s*(?:usd|dollars?|bucks?|\$)?$/i)
+  if (m) {
+    const value = normaliseMoney(m[1])
+    if (value != null) return { kind: 'price', value }
+  }
+  return { kind: 'description', text: t }
+}
+
+function batchSummaryLine(item: ShelfBatchItem): string {
+  const price = item.price != null ? `$${item.price}` : 'price not listed'
+  return `• *${item.name}* — ${price}`
+}
+
+/** Ask which live shop a batch belongs to when the seller owns several. */
+async function askBatchShop(from: string, batch: ItemBatch, msgId?: string) {
+  const bizList = await findActiveListingsForPhone(from)
+  const rows = bizList.slice(0, 3).map(b => ({ id: `itembatchbiz_${b.id}`, title: b.name }))
+  if (!rows.length) {
+    await clearSession(from)
+    await sendWhatsAppMessage(from, 'I could not find a live shop for this number. Send *register* to list your business first.', msgId)
+    return
+  }
+  await saveSession(from, 'item_batch', { itemBatch: batch })
+  await sendInteractiveButtons(from, '🧺 Which shop are these items for?', rows, msgId)
+}
+
+/** Add one photo to the shelf batch (recognise it immediately, then keep the
+ * seller going until 5 photos or an explicit Done). */
+async function handleShelfBatchImage(
+  from: string,
+  session: ChatSession | null,
+  mediaId: string,
+  caption: string,
+  mediaMsgId: string,
+  bizList: ShelfBiz[]
+) {
+  const existing = session?.data.itemBatch
+  if (existing?.asking != null) {
+    await sendWhatsAppMessage(
+      from,
+      `Finish setting prices first - how much is the *${existing.items[existing.asking]?.name || 'item'}*? Reply a price, or *skip*.`,
+      mediaMsgId
+    )
+    return
+  }
+  if (!existing && bizList.length === 0) {
+    await sendWhatsAppMessage(from, 'I could not find a live shop for this number. Send *register* to list your business first.', mediaMsgId)
+    return
+  }
+  if ((existing?.imageCount || 0) >= SHELF_BATCH_MAX) {
+    await finalizeShelfBatch(
+      from,
+      session || { phone: from, step: 'item_batch', data: { itemBatch: existing! } },
+      mediaMsgId
+    )
+    return
+  }
+
+  void markRead(mediaMsgId, true).catch(() => {})
+  const media = await fetchWhatsAppMedia(mediaId)
+  const imageUrl = media ? (await uploadLogoImage(new Uint8Array(media.buffer))) || '' : ''
+  if (!imageUrl) {
+    await sendWhatsAppMessage(from, "I couldn't save that photo. Send a JPG or PNG under 2MB, or reply *done* to continue.", mediaMsgId)
+    return
+  }
+
+  const recognised = media ? await recognizeShelfItems(media.buffer, media.mime, caption) : null
+  const fallbackName = caption && !caption.includes('$')
+    ? caption.trim().slice(0, 60)
+    : `Item ${(existing?.items.length || 0) + 1}`
+  const found = recognised && recognised.length
+    ? recognised
+    : [{ name: fallbackName || 'Item', price: priceFromCaption(caption), description: caption && !caption.includes('$') ? caption.trim() : '' }]
+
+  const business = existing
+    ? { id: existing.businessId, name: existing.businessName }
+    : bizList.length === 1
+      ? { id: bizList[0].id, name: bizList[0].name }
+      : { id: '', name: '' }
+
+  const items: ShelfBatchItem[] = [
+    ...(existing?.items || []),
+    ...found.map(f => ({
+      name: f.name || 'Item',
+      price: f.price ?? null,
+      description: f.description || undefined,
+      imageUrl,
+    })),
+  ]
+  const imageCount = (existing?.imageCount || 0) + 1
+
+  const batch: ItemBatch = { businessId: business.id, businessName: business.name, items, imageCount }
+
+  if (!batch.businessId) {
+    await askBatchShop(from, batch, mediaMsgId)
+    return
+  }
+
+  if (imageCount >= SHELF_BATCH_MAX) {
+    await saveSession(from, 'item_batch', { itemBatch: batch })
+    await finalizeShelfBatch(from, { phone: from, step: 'item_batch', data: { itemBatch: batch } }, mediaMsgId)
+    return
+  }
+
+  await saveSession(from, 'item_batch', { itemBatch: batch })
+  await sendInteractiveButtons(
+    from,
+    [
+      `📷 Saved photo ${imageCount}/${SHELF_BATCH_MAX}.`,
+      '',
+      ...items.map(batchSummaryLine),
+      '',
+      'Send another photo, or tap *Done* and I will ask for prices.',
+    ].join('\n'),
+    [
+      { id: 'itembatch_done', title: '✅ Done - set prices' },
+      { id: 'itembatch_cancel', title: '✖ Cancel' },
+    ],
+    mediaMsgId
+  )
+}
+
+/** Ask the next unpriced item, or insert everything once prices are settled. */
+async function finalizeShelfBatch(from: string, session: ChatSession, msgId?: string) {
+  const batch = session.data.itemBatch
+  if (!batch) {
+    await sendWhatsAppMessage(from, 'No photos saved. Send a product photo to start again.', msgId)
+    return
+  }
+  if (!batch.businessId) {
+    await askBatchShop(from, batch, msgId)
+    return
+  }
+  if (!batch.items.length) {
+    await clearSession(from)
+    await sendWhatsAppMessage(from, 'No items saved. Send your product photos again.', msgId)
+    return
+  }
+
+  const idx = batch.items.findIndex(i => i.price == null && !i.priceSkipped)
+  if (idx >= 0) {
+    const next: ItemBatch = { ...batch, asking: idx }
+    await saveSession(from, 'item_batch', { itemBatch: next })
+    const item = batch.items[idx]
+    await sendInteractiveButtons(
+      from,
+      [
+        `🛒 *${batch.items.length} item${batch.items.length === 1 ? '' : 's'} recognised.*`,
+        '',
+        `How much is the *${item.name}*?`,
+        '',
+        'Reply a price like *50*, *$50* or *10 usd*, or *skip* if you do not want a price.',
+        '_No price? Send what it is (colour, size, condition) and I will keep that as the description._',
+      ].join('\n'),
+      [
+        { id: 'itembatch_skip', title: '⏭ Skip price' },
+        { id: 'itembatch_cancel', title: '✖ Cancel' },
+      ],
+      msgId
+    )
+    return
+  }
+
+  // Every price is settled - write the shelf rows and summarise.
+  const biz = batch.businessId
+  let saved = 0
+  for (const item of batch.items) {
+    const ok = await insertShelfItem(
+      biz,
+      { name: item.name, price: item.price, description: item.description },
+      item.imageUrl
+    )
+    if (ok) saved += 1
+  }
+  await clearSession(from)
+  const lines = batch.items.map(batchSummaryLine)
+  const described = batch.items.filter(i => i.description)
+  await sendWhatsAppMessage(
+    from,
+    [
+      `✅ *${saved} item${saved === 1 ? '' : 's'} added to ${batch.businessName}.*`,
+      '',
+      ...lines,
+      ...(described.length ? ['', '📝 *Details:*', ...described.map(i => `> *${i.name}:* ${i.description}`)] : []),
+      '',
+      'Customers can now see these in your shop. Send more photos anytime.',
+    ].join('\n'),
+    msgId
+  )
+}
+
+/** A typed answer while a batch price is being asked. */
+async function handleBatchPriceReply(from: string, session: ChatSession, text: string) {
+  const batch = session.data.itemBatch
+  if (!batch || batch.asking == null) return false
+  const item = batch.items[batch.asking]
+  if (!item) return false
+
+  const parsed = parsePriceReply(text)
+  if (parsed.kind === 'price') item.price = parsed.value
+  else if (parsed.kind === 'skip') item.priceSkipped = true
+  else {
+    item.description = [item.description, parsed.text].filter(Boolean).join(' — ').slice(0, 300)
+    item.priceSkipped = true
+  }
+
+  const next: ItemBatch = { ...batch, asking: undefined, items: [...batch.items] }
+  await saveSession(from, 'item_batch', { itemBatch: next })
+  await finalizeShelfBatch(from, { phone: from, step: 'item_batch', data: { itemBatch: next } })
+  return true
 }
 
 // A photo sent while the order verify screen is up is part of the order, not a
@@ -2220,6 +2480,12 @@ async function handleBotMedia(
     return
   }
 
+  // Seller shelf batch: keep collecting (or finish) the 5-photo upload.
+  if (kind === 'image' && session?.step === 'item_batch') {
+    await handleShelfBatchImage(from, session, mediaId, caption, mediaMsgId, [])
+    return
+  }
+
   const convState = await getConversationState(from)
   if (convState && convState.state.startsWith('REGISTRATION_') && kind === 'image') {
     const media = await fetchWhatsAppMedia(mediaId)
@@ -2238,12 +2504,12 @@ async function handleBotMedia(
   }
 
   // Post-activation shelf: a live business owner sending a photo with no flow
-  // in progress is most likely stocking their website shop shelf — no AI pass
-  // needed, just storage.
+  // in progress is most likely stocking their website shop shelf. Photos are
+  // batched (up to 5), recognised, then priced one item at a time.
   if (kind === 'image' && !session) {
     const bizList = await findActiveListingsForPhone(from)
     if (bizList.length > 0) {
-      await startShelfItem(from, bizList, mediaId, caption, mediaMsgId)
+      await handleShelfBatchImage(from, null, mediaId, caption, mediaMsgId, bizList)
       return
     }
   }
@@ -2830,7 +3096,7 @@ async function handlePaySearchText(from: string, session: ChatSession, text: str
       await sendRegisterChoice(from)
     } else {
       // User typed something like "register my bakery" - start with the new flow
-      await startRegistrationFlow(from)
+      await startRegister(from)
     }
     return
   }
@@ -3549,7 +3815,7 @@ async function handleAdminCommand(from: string, text: string): Promise<boolean> 
       return true
     }
     await resetForNewSearch(from, adminSession)
-    await startRegistrationFlow(owner, { force: true })
+    await startRegister(owner)
     await sendWhatsAppMessage(
       from,
       [
@@ -4891,6 +5157,59 @@ async function handleAction(from: string, session: ChatSession | null, action: s
     return
   }
 
+  // ── Post-activation shelf batch: finish, skip a price, or pick the shop ──
+  if (action === 'itembatch_done' || action === 'itembatch_skip' || action === 'itembatch_cancel') {
+    const live = session || (await getSession(from))
+    if (!live || live.step !== 'item_batch' || !live.data.itemBatch) {
+      await sendWhatsAppMessage(from, 'That upload has expired - send your product photos again.')
+      return
+    }
+    if (action === 'itembatch_cancel') {
+      await clearSession(from)
+      await sendWhatsAppMessage(from, 'Cancelled - no items were added to your shop.')
+      return
+    }
+    if (action === 'itembatch_skip') {
+      await handleBatchPriceReply(from, live, 'skip')
+      return
+    }
+    await finalizeShelfBatch(from, live)
+    return
+  }
+  const itemBatchBiz = action.match(/^itembatchbiz_(.+)$/)
+  if (itemBatchBiz) {
+    const live = session || (await getSession(from))
+    const batch = live?.data.itemBatch
+    if (!live || live.step !== 'item_batch' || !batch) {
+      await sendWhatsAppMessage(from, 'That upload has expired - send your product photos again.')
+      return
+    }
+    const { data: row } = await getSupabase()
+      .from('businesses')
+      .select('id, name')
+      .eq('id', itemBatchBiz[1])
+      .maybeSingle()
+    const next: ItemBatch = {
+      ...batch,
+      businessId: itemBatchBiz[1],
+      businessName: row?.name || 'your shop',
+    }
+    await saveSession(from, 'item_batch', { itemBatch: next })
+    if ((next.imageCount || 0) >= SHELF_BATCH_MAX) {
+      await finalizeShelfBatch(from, { phone: from, step: 'item_batch', data: { itemBatch: next } })
+      return
+    }
+    await sendInteractiveButtons(
+      from,
+      `📷 Saved ${next.imageCount || 0}/${SHELF_BATCH_MAX} photos for *${next.businessName}*.\n\nSend another photo, or tap *Done* and I will ask for prices.`,
+      [
+        { id: 'itembatch_done', title: '✅ Done - set prices' },
+        { id: 'itembatch_cancel', title: '✖ Cancel' },
+      ]
+    )
+    return
+  }
+
   // ── Post-activation shelf: product photos → business_items ───────────
   // The photo was uploaded up-front; the owner tapped which shop it belongs
   // to, now it needs a name + price.
@@ -5222,7 +5541,7 @@ async function handleAction(from: string, session: ChatSession | null, action: s
     case 'menu_register': {
       // The new flow handles resume via Supabase state automatically.
       // Just start the registration flow - it will detect and resume any in-progress registration.
-      await startRegistrationFlow(from)
+      await startRegister(from)
       return
     }
     case 'resume_paused': {
@@ -5235,67 +5554,28 @@ async function handleAction(from: string, session: ChatSession | null, action: s
       await sendRegisterChoice(from)
       return
     case 'reg_business':
-      await startRegistrationFlow(from)
+      await startRegister(from)
       return
-    case 'reg_personal': {
-      await saveSession(from, 'reg_contact', {})
-      await sendWhatsAppMessage(
-        from,
-        [
-          'Add a personal contact to the directory 📱',
-          '',
-          "Send the contact's name + phone (+ city, socials optional), e.g.",
-          '*Tendai Ncube 0771 234 567 Harare IG @tendai*',
-          '',
-          '$1 per month · $5 for 6 months · $10 for the full year.',
-          'Paid via EcoCash.'
-        ].join('\n')
-      )
-      return
-    }
+    // Personal contacts were removed from sign-up. Old buttons still land
+    // here, so they now begin a business listing instead of a dead end.
+    case 'reg_personal':
     case 'reg_contact_pay_monthly':
-    case 'reg_contact_publish': {
-      if (session?.step === 'reg_contact' && session.data.contact) {
-        await tryPublishContact(from, session, msgId, '1m')
-      } else {
-        await sendRegisterChoice(from)
-      }
-      return
-    }
-    case 'reg_contact_pay_6m': {
-      if (session?.step === 'reg_contact' && session.data.contact) {
-        await tryPublishContact(from, session, msgId, '6m')
-      } else {
-        await sendRegisterChoice(from)
-      }
-      return
-    }
-    case 'reg_contact_pay_year': {
-      if (session?.step === 'reg_contact' && session.data.contact) {
-        await tryPublishContact(from, session, msgId, '12m')
-      } else {
-        await sendRegisterChoice(from)
-      }
-      return
-    }
+    case 'reg_contact_publish':
+    case 'reg_contact_pay_6m':
+    case 'reg_contact_pay_year':
     case 'reg_contact_fix': {
-      await saveSession(from, 'reg_contact', {})
       await sendWhatsAppMessage(
         from,
-        [
-          'Add a personal contact to the directory 📱',
-          '',
-          "Send the contact's name + phone (+ city, socials optional), e.g.",
-          '*Tendai Ncube 0771 234 567 Harare IG @tendai*',
-        ].join('\n')
+        'Personal contacts are no longer offered. Let\'s list your business instead 👇'
       )
+      await sendRegisterChoice(from)
       return
     }
     case 'list_publish': {
       if (session?.step === 'list_form') {
         await tryPublishForm(from, session, msgId)
       } else {
-        await startRegistrationFlow(from)
+        await startRegister(from)
       }
       return
     }
@@ -5305,7 +5585,7 @@ async function handleAction(from: string, session: ChatSession | null, action: s
         await saveSession(from, 'list_form', { ...session.data, list: before, wizard: 0 } as ChatSessionData)
         await sendWizardQuestion(from, before, 0, "Let's go through your answers again - *Skip* anything you want to keep.")
       } else {
-        await startRegistrationFlow(from)
+        await startRegister(from)
       }
       return
     }
@@ -5318,6 +5598,18 @@ async function handleAction(from: string, session: ChatSession | null, action: s
     case 'list_cancel':
       await clearSession(from)
       await sendWhatsAppMessage(from, 'Registration cancelled. Send *help* anytime.')
+      return
+    case 'role_buyer': {
+      const name = (await getBotContactName(from)) || ''
+      await sendInteractiveButtons(from, renderBuyerIntro(name || undefined), [
+        { id: 'menu_needs', title: '🛒 Post a need' },
+        { id: 'menu_help', title: '✆ Help' },
+        { id: 'role_seller', title: "🏪 I'm a seller" },
+      ])
+      return
+    }
+    case 'role_seller':
+      await sendRegisterChoice(from)
       return
     case 'menu_help':
       await sendWhatsAppMessage(from, await helpText(from))
@@ -5334,7 +5626,7 @@ async function handleAction(from: string, session: ChatSession | null, action: s
       return
     case 'pay_new':
       await clearSession(from)
-      await startRegistrationFlow(from)
+      await startRegister(from)
       return
     case 'pay_1m':
     case 'pay_6m':
@@ -5365,7 +5657,7 @@ async function handleAction(from: string, session: ChatSession | null, action: s
         return
       }
       // Fallback: no registration state, just show plan choice
-      await startRegistrationFlow(from)
+      await startRegister(from)
       return
     }
     case 'whole_country':
@@ -7031,19 +7323,51 @@ async function handlePhotoPick(from: string, businessId: string) {
   await sendInteractiveList(from, '📸 Which item would you like to see?', rows, '📸 Pick an item')
 }
 
-/** 💬 Chat on WhatsApp: the tracked /go handoff (records attribution +
- * transcript), same link the web app opens. */
+/** 💬 Chat on WhatsApp.
+ *
+ * The old CTA opened the /go redirect in WhatsApp's in-app browser, which
+ * handed the wa.me link to the phone's DEFAULT WhatsApp handler. Anyone using
+ * WhatsApp Business was pushed into personal WhatsApp. A WhatsApp contact
+ * card is handled inside the app the customer is already in, so the message
+ * button opens WhatsApp Business instead. */
 async function handleCtaChat(from: string, businessId: string) {
   const { data: b } = await getSupabase()
     .from('businesses')
-    .select('id, name')
+    .select('id, name, phone, phone_type')
     .eq('id', businessId)
     .maybeSingle()
   if (!b) {
     await sendWhatsAppMessage(from, 'That listing is not available anymore. Type your search again.')
     return
   }
-  await sendCtaUrl(from, renderChatPrompt(b.name || 'this shop'), '💬 Chat on WhatsApp', chatCtaUrl(businessId, from))
+  const name = b.name || 'this shop'
+  const digits = digitsOnly(b.phone || '')
+  if (!digits || b.phone_type === 'voice') {
+    await sendWhatsAppMessage(
+      from,
+      digits
+        ? `☎️ *${name}* is call-only. Call ${formatPhone(digits)}.`
+        : `*${name}* has not shared a direct number yet. Browse their items here and I'll keep you posted.`
+    )
+    return
+  }
+  const intl = digits.startsWith('263')
+    ? digits
+    : digits.startsWith('0')
+      ? `263${digits.slice(1)}`
+      : digits
+  await sendContactCard(from, name, intl)
+  await sendWhatsAppMessage(
+    from,
+    [
+      `💬 *Chat with ${name}*`,
+      '',
+      'Tap the contact above, then *Message* to open the chat.',
+      'This stays in the app you are using - WhatsApp Business included - so you are not pushed into personal WhatsApp.',
+      '',
+      `Number: +${intl}`,
+    ].join('\n')
+  )
 }
 
 async function handleAddToCart(from: string, session: ChatSession | null, itemId: string, msgId?: string) {
@@ -7853,9 +8177,20 @@ export async function POST(request: Request) {
             const contactName = await getBotContactName(from)
             if (contactName) greetName = contactName
           }
-          const body = wasKnown
-            ? renderWelcomeBack(greetName)
-            : renderFirstWelcome(greetName, await channelLinkRaw())
+          if (!wasKnown) {
+            // First contact: the buyer/seller fork saves typing and leads each
+            // person into the right flow immediately.
+            await sendInteractiveButtons(
+              from,
+              `👋 *Welcome to WA Directory${greetName ? `, ${greetName}` : ''}!*\n\nAre you here to *buy*, or to *sell / list a business*?`,
+              [
+                { id: 'role_buyer', title: "🛒 I'm a buyer" },
+                { id: 'role_seller', title: "🏪 I'm a seller" },
+              ]
+            )
+            continue
+          }
+          const body = renderWelcomeBack(greetName)
           await sendInteractiveList(from, body, MENU_ROWS, 'Main menu')
           continue
         }
@@ -7887,6 +8222,13 @@ export async function POST(request: Request) {
 
         const convState = await getConversationState(from)
         if (convState && convState.state.startsWith('REGISTRATION_')) {
+          // A fresh register command replaces an old plan-screen registration
+          // with the short business-question wizard.
+          if (registrationCommand(text)) {
+            await clearConversationState(from)
+            await startRegister(from)
+            continue
+          }
           // "resume" is not an answer to a registration question. Say where
           // the person is instead of saving "resume" as their business name.
           if (resumeAsk) {
@@ -8334,6 +8676,27 @@ export async function POST(request: Request) {
           continue
         }
 
+        // ── Shelf batch: collecting photos or answering a price question ──
+        if (session?.step === 'item_batch') {
+          if (lower === 'cancel' || lower === 'help') {
+            await clearSession(from)
+            await sendWhatsAppMessage(from, lower === 'cancel' ? CANCEL_TEXT : await helpText(from))
+            continue
+          }
+          if (session.data.itemBatch?.asking != null) {
+            if (await handleBatchPriceReply(from, session, text)) continue
+          }
+          if (/^(?:done|finish(?:ed)?|that'?s all|no more|ready|continue|submit)$/i.test(lower.trim())) {
+            await finalizeShelfBatch(from, session)
+            continue
+          }
+          await sendWhatsAppMessage(
+            from,
+            `Send another product photo (up to ${SHELF_BATCH_MAX}), or reply *done* and I will ask for the prices.`
+          )
+          continue
+        }
+
         // ── Shelf item: photo queued, waiting for "name $price" ────────
         if (session?.step === 'item_photo') {
           if (lower === 'cancel' || lower === 'help') {
@@ -8427,7 +8790,7 @@ export async function POST(request: Request) {
           } else {
             // The message already names a business (or a supplier/shop), so
             // skip the business-vs-personal question and open the form.
-            await startRegistrationFlow(from)
+            await startRegister(from)
           }
           continue
         }

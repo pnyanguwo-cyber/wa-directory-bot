@@ -99,6 +99,9 @@ export interface ChatSessionData {
   // Pending product photo (item_photo flow): uploaded URL awaiting name+price.
   pendingItemImage?: string
   pendingItemBiz?: { id: string; name: string }
+  // Seller shelf upload batch (step 'item_batch'): up to 5 photos are
+  // recognised first, then each unpriced item is asked for a price.
+  itemBatch?: ItemBatch
   // Broadcast draft (admin_cast step): segment + filter + body + optional
   // release time, waiting on the ✅/⏰ confirm tap.
   castSpec?: import('@wa-directory/shared').CastSpec
@@ -133,6 +136,29 @@ export interface ChatSessionData {
   // Current item-browsing context: which business + page we're viewing.
   browseBizId?: string
   browsePage?: number
+}
+
+// One recognised photo in a seller's shelf-upload batch.
+export interface ShelfBatchItem {
+  name: string
+  price: number | null
+  description?: string
+  imageUrl: string
+  // True once the seller has skipped the price question for this item.
+  priceSkipped?: boolean
+}
+
+// Seller shelf-upload batch: images are recognised as they arrive; prices are
+// then asked one item at a time (a text reply becomes the description).
+export interface ItemBatch {
+  businessId: string
+  businessName: string
+  items: ShelfBatchItem[]
+  // Photos received in this batch (one photo may yield several items).
+  imageCount?: number
+  // Index of the item whose price is currently being asked. Undefined while
+  // the seller is still sending photos.
+  asking?: number
 }
 
 // One item in the cross-business chat cart.

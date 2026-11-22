@@ -117,7 +117,7 @@ const PIVOT_BLOCK = /\b(?:office|agency|agencies|school|hospital|form|plate)\b/
 export type RegistrationCommand = 'choice' | 'start'
 
 const REGISTRATION_GENERIC =
-  /^(?:register|registration|sign\s?up|sign\s?me\s?up|join|list|advertise|enrol|enroll|get listed|be listed)$/i
+  /^(?:register|registration|sign\s?up|sign\s?me\s?up|join|list|advertise|enrol|enroll|get listed|be listed|connect|connect\s+(?:my|our)\s+(?:business|company|shop|store))$/i
 const REGISTRATION_VERB =
   /^(?:register|list|add|create|open|start|put|advertise|join|become|be|enrol|enroll|sell)\b/i
 const REGISTRATION_CONTEXT =

@@ -73,6 +73,82 @@ export async function fetchWhatsAppMedia(
   }
 }
 
+export interface ShelfRecognition {
+  name: string
+  price: number | null
+  description: string
+}
+
+
+/** A caption only carries a price when a dollar sign is present. "50" alone
+ * (or "50 usd" typed as a caption) is description, not price. */
+export function priceFromCaption(caption: string): number | null {
+  if (!caption || !caption.includes('$')) return null
+  const m = caption.match(/\$\s*(\d+(?:[.,]\d{1,2})?)|(\d+(?:[.,]\d{1,2})?)\s*\$/)
+  if (!m) return null
+  const value = Number((m[1] || m[2] || '').replace(',', '.'))
+  return Number.isFinite(value) && value > 0 ? value : null
+}
+
+/** Identify the product(s) in one photo for a seller's shop shelf. One photo
+ * can hold several recognisable items (a bed, chair and stove in a room).
+ * Best-effort: null means the caller should fall back to asking for a name. */
+export async function recognizeShelfItems(
+  buffer: Buffer,
+  mime: string,
+  caption?: string
+): Promise<ShelfRecognition[] | null> {
+  if (buffer.length === 0 || buffer.length > MAX_ANALYZE_BYTES) return null
+  const dataMime = inlineMime('image', mime)
+  if (!dataMime) return null
+
+  const captionLine = caption ? `\nThe seller's caption: "${caption}".` : ''
+  const instruction =
+    `This is a product photo a Zimbabwe shop owner is adding to their online shelf.${captionLine}\n\n` +
+    `Identify every distinct product the seller is offering in the photo, in plain English (1-4 words each), e.g. "wooden bed", "office chair", "gas stove". ` +
+    `If the photo shows one product, return one item. If it clearly shows several products, return each one.\n` +
+    `PRICE RULE: a price is allowed ONLY when a dollar sign ($) appears in the caption or is clearly written on the item. ` +
+    `If no $ appears anywhere, price MUST be null and all caption words are a description, not a price.\n` +
+    `The description is the seller's own words about the item (colour, size, condition, delivery, etc.), or a short plain description of what is visible.\n` +
+    `Reply ONLY with a JSON object: {"items":[{"name":"<product name>","price":<number or null>,"description":"<short description or empty>"}]}. No markdown.`
+
+  const parts: GeminiPart[] = [
+    { text: instruction },
+    { inline_data: { mime_type: dataMime, data: buffer.toString('base64') } },
+  ]
+
+  const raw = await callGeminiParts(parts)
+  if (!raw) return null
+  const match = raw.match(/\{[\s\S]*\}/)
+  if (!match) return null
+  try {
+    const parsed = JSON.parse(match[0]) as { items?: unknown }
+    const list = Array.isArray(parsed.items) ? parsed.items : []
+    const out: ShelfRecognition[] = []
+    const captionPrice = priceFromCaption(caption || '')
+    for (const entry of list.slice(0, 6)) {
+      if (!entry || typeof entry !== 'object') continue
+      const row = entry as Record<string, unknown>
+      const str = (k: string) =>
+        typeof row[k] === 'string' ? (row[k] as string).trim().slice(0, 300) : ''
+      const rawPrice = Number(row.price)
+      let price = Number.isFinite(rawPrice) && rawPrice > 0 ? rawPrice : null
+      // Enforce the seller rule in code too: caption text without a $ cannot be
+      // a price, even if the model guessed one.
+      if (caption && caption.trim() && !caption.includes('$')) price = null
+      if (price == null && captionPrice != null) price = captionPrice
+      out.push({
+        name: (str('name') || 'Item').slice(0, 80),
+        price,
+        description: str('description'),
+      })
+    }
+    return out.length ? out : null
+  } catch {
+    return null
+  }
+}
+
 export interface MediaSense {
   transcript?: string
   term?: string
