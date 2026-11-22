@@ -21,21 +21,7 @@ import { logBotMessage, logBotSearch } from '@wa-directory/shared'
 import { orderSearchResults } from '@wa-directory/shared'
 import { expandSearchQuery, classifyIntent } from '@wa-directory/shared'
 import type { Business } from '@wa-directory/shared'
-import {
-  startRegistrationFlow,
-  chooseRegistrationPlan,
-  handleRegistrationMessage,
-  handleRegistrationImage,
-  REGISTRATION_BUTTONS,
-} from '@wa-directory/shared'
-import {
-  getConversationState,
-  setConversationState,
-  updateConversationContext,
-  clearConversationState,
-  hasActiveOnboardingState,
-  ConversationState,
-} from '@wa-directory/shared'
+import { getConversationState, clearConversationState } from '@wa-directory/shared'
 import { TRIAL_PLAN_LABEL, TRIAL_DAYS } from '@wa-directory/shared'
 import {
   getSession,
@@ -2685,20 +2671,14 @@ async function handleBotMedia(
     return
   }
 
+  // The old image-first registration flow is retired. If a stale shared
+  // registration state is still open, clear it and start the short manual
+  // wizard instead of processing a business-card photo.
   const convState = await getConversationState(from)
-  if (convState && convState.state.startsWith('REGISTRATION_') && kind === 'image') {
-    const media = await fetchWhatsAppMedia(mediaId)
-    if (media) {
-      console.log(`[bot-media] registration photo routed to extraction (${from})`)
-      await handleRegistrationImage(from, new Uint8Array(media.buffer), caption)
-    } else {
-      console.warn(`[bot-media] registration photo download failed (${from}, ${mediaId})`)
-      await sendWhatsAppMessage(
-        from,
-        "I couldn't download that picture. Send it again as a photo, or reply *skip* to continue without one.",
-        mediaMsgId
-      )
-    }
+  if (convState && convState.state.startsWith('REGISTRATION_')) {
+    await clearConversationState(from)
+    await sendWhatsAppMessage(from, "Let's list your business - I'll ask a few quick questions.", mediaMsgId)
+    await startRegister(from)
     return
   }
 
@@ -5834,27 +5814,24 @@ async function handleAction(from: string, session: ChatSession | null, action: s
       await clearSession(from)
       await sendWhatsAppMessage(from, CANCEL_TEXT)
       return
-    // New registration flow buttons
+    // Old image-first registration buttons. That flow is retired, so every
+    // one of them now opens the short manual wizard (cancel still cancels).
     case 'reg_plan_trial':
     case 'reg_plan_paid':
     case 'reg_upload':
     case 'reg_skip':
     case 'reg_proceed':
     case 'reg_publish':
-    case 'reg_cancel':
     case 'reg_edit':
     case 'reg_talk_admin':
     case 'reg_ask_admin_permission':
-    case 'reg_change_phone': {
-      const convState = await getConversationState(from)
-      if (convState && convState.state.startsWith('REGISTRATION_')) {
-        await handleRegistrationMessage(from, action, convState.context)
-        return
-      }
-      // Fallback: no registration state, just show plan choice
+    case 'reg_change_phone':
       await startRegister(from)
       return
-    }
+    case 'reg_cancel':
+      await clearSession(from)
+      await sendWhatsAppMessage(from, CANCEL_TEXT)
+      return
     case 'whole_country':
       if (session?.step === 'search_loc' && session.data.pending_search_term) {
         await clearSession(from)
@@ -8388,10 +8365,9 @@ export async function POST(request: Request) {
           continue
         }
 
-        // ── New registration flow (REGISTRATION_* states from Supabase) ───────
-        // Checked before the pivot/shelved-draft matchers below: an active
-        // registration owns every text reply, and a stale session row from an
-        // earlier flow must not hijack words like "help me".
+        // ── Retired image-first registration (REGISTRATION_* states) ─────────
+        // A stale shared-flow row must not keep asking for a business-card
+        // photo. Clear it and move straight to the short manual wizard.
         // Pick up a flow that an earlier direction change shelved (the draft
         // lives in the session row, which may be the 'idle' placeholder).
         // A resume request with nothing to resume answers plainly - it used to
@@ -8402,23 +8378,31 @@ export async function POST(request: Request) {
 
         const convState = await getConversationState(from)
         if (convState && convState.state.startsWith('REGISTRATION_')) {
-          // A fresh register command replaces an old plan-screen registration
-          // with the short business-question wizard.
-          if (registrationCommand(text)) {
-            await clearConversationState(from)
-            await startRegister(from)
+          // The old image-first registration flow is retired. Clear whatever
+          // stale shared state is left and continue with the short manual
+          // wizard. A first answer typed here seeds the wizard; the old
+          // buttons (skip/manual/register) do not become the business name.
+          await clearConversationState(from)
+          const t = text.trim()
+          if (/^(?:cancel|stop|quit)$/i.test(t)) {
+            await clearSession(from)
+            await sendWhatsAppMessage(from, CANCEL_TEXT)
             continue
           }
-          // "resume" is not an answer to a registration question. Say where
-          // the person is instead of saving "resume" as their business name.
-          if (resumeAsk) {
-            await sendWhatsAppMessage(
-              from,
-              '📝 Your registration is still open - answer the last question above to carry on, or send *cancel* to stop.\n\nType *menu* for everything else.'
-            )
+          if (/^help$/i.test(t)) {
+            await sendWhatsAppMessage(from, await helpText(from))
             continue
           }
-          await handleRegistrationMessage(from, text, convState.context)
+          if (/^menu$/i.test(t)) {
+            await sendMainMenu(from)
+            continue
+          }
+          const seed = /^(?:hi|hello|hey|hie|howdy|skip|manual|enter manually|register|start|resume|continue)\b/i.test(
+            t
+          )
+            ? ''
+            : text
+          await startRegister(from, seed)
           continue
         }
 
