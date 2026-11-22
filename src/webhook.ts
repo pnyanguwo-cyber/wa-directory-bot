@@ -1,3 +1,4 @@
+import '../lib/gemini-default.js'
 import crypto from 'node:crypto'
 import {
   sendWhatsAppMessage as sendWhatsAppText,
