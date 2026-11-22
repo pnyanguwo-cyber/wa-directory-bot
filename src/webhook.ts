@@ -4017,6 +4017,172 @@ async function releaseChat(adminFrom: string, num: string): Promise<void> {
   await sendWhatsAppMessage(adminFrom, `✅ +${num} handed back to the bot.`)
 }
 
+// ── Admin rewrites (category/location requests) ──────────────────────────
+// A request often arrives with a typo, a duplicate category, or a business
+// name that needs correcting before approval. Admins can rewrite those fields
+// in one line, e.g.
+//   rewrite req 1 name: Hardware & Tools business: Joe's Hardware
+//   approve req 1 name: Hardware city: Harare
+//   connect req 1 category: Hardware
+// `category:` means "file it under this existing category" (the same job as
+// connect). The rest edit the request or the business attached to it.
+type AdminRewriteFields = {
+  name?: string
+  category?: string
+  business?: string
+  city?: string
+  description?: string
+}
+
+function parseAdminRewrite(text: string): {
+  fields: AdminRewriteFields
+  bare: string
+  used: boolean
+} {
+  const fields: AdminRewriteFields = {}
+  const matches = [...text.matchAll(/\b(name|category|business|city|description)\s*[:=]\s*/gi)]
+  if (!matches.length) {
+    // Keep the old one-value shorthand: `approve req 1 Hardware` and
+    // `connect req 1 to Hardware` still mean exactly what they did.
+    return { fields, bare: text.replace(/^(?:to|as)\s+/i, '').trim(), used: false }
+  }
+  const bare = text.slice(0, matches[0].index).trim()
+  matches.forEach((m, i) => {
+    const start = (m.index || 0) + m[0].length
+    const end = i + 1 < matches.length ? (matches[i + 1].index || text.length) : text.length
+    const value = text
+      .slice(start, end)
+      .trim()
+      .replace(/^["']|["']$/g, '')
+      .replace(/[,;]\s*$/, '')
+      .trim()
+    if (value) fields[m[1].toLowerCase() as keyof AdminRewriteFields] = value
+  })
+  return { fields, bare, used: true }
+}
+
+function rewriteSummary(changed: string[]): string {
+  return changed.length ? changed.join(' · ') : 'nothing changed'
+}
+
+function rewritePrefix(changed: string[]): string {
+  return changed.length ? `✏️ ${changed.join(' · ')}\n\n` : ''
+}
+
+/** Apply `name:` / `business:` / `city:` / `description:` edits to a request. */
+async function rewriteFeatureRequest(
+  id: string,
+  fields: AdminRewriteFields
+): Promise<{ ok: boolean; error?: string; changed: string[]; name?: string; categoryTarget?: string }> {
+  const supabase = getSupabase()
+  const { data: req } = await supabase
+    .from('feature_requests')
+    .select('id, type, name, city, business_id, status')
+    .eq('id', id)
+    .maybeSingle()
+  if (!req) return { ok: false, error: 'Request not found.', changed: [] }
+  if (req.status !== 'pending') return { ok: false, error: `Already ${req.status}.`, changed: [] }
+
+  const type = String(req.type)
+  const oldName = String(req.name)
+  const businessId = req.business_id as string | null
+  let requestName = oldName
+  const changed: string[] = []
+  const patchRequest: Record<string, unknown> = {}
+  const patchBiz: Record<string, unknown> = {}
+
+  let biz: {
+    name?: string
+    category?: string[]
+    areas?: string[]
+    city?: string
+    requested_category?: string
+    bio?: string
+  } | null = null
+  if (businessId) {
+    const { data } = await supabase
+      .from('businesses')
+      .select('name, category, areas, city, requested_category, bio')
+      .eq('id', businessId)
+      .maybeSingle()
+    biz = data || null
+  }
+
+  if (fields.name) {
+    const name = fields.name.trim()
+    if (name.length < 2 || name.length > 60) {
+      return { ok: false, error: 'The requested name needs 2–60 characters.', changed }
+    }
+    requestName = name
+    patchRequest.name = name
+    changed.push(`name → *${name}*`)
+    if (biz) {
+      if (type === 'category') {
+        const cats = (biz.category || []).map(n => (n === oldName ? name : n))
+        if (JSON.stringify(cats) !== JSON.stringify(biz.category || [])) patchBiz.category = cats
+        const provisional = (biz.requested_category || '').trim().toLowerCase()
+        if (provisional && provisional === oldName.toLowerCase()) patchBiz.requested_category = name
+      } else if (type === 'area') {
+        const areas = (biz.areas || []).map(n => (n === oldName ? name : n))
+        if (JSON.stringify(areas) !== JSON.stringify(biz.areas || [])) patchBiz.areas = areas
+      } else if (type === 'city' && (biz.city || '').toLowerCase() === oldName.toLowerCase()) {
+        patchBiz.city = ''
+      }
+    }
+  }
+
+  if (fields.business) {
+    const name = fields.business.trim()
+    if (name.length < 2 || name.length > 80) {
+      return { ok: false, error: 'The business name needs 2–80 characters.', changed }
+    }
+    if (!businessId) return { ok: false, error: 'This request is not attached to a business.', changed }
+    patchBiz.name = name
+    changed.push(`business → *${name}*`)
+  }
+
+  if (fields.city) {
+    const city = fields.city.trim()
+    if (city.length < 2 || city.length > 60) {
+      return { ok: false, error: 'The city needs 2–60 characters.', changed }
+    }
+    if (type === 'city') {
+      // For a city request, `city:` is the requested city itself.
+      requestName = city
+      patchRequest.name = city
+      changed.push(`city → *${city}*`)
+    } else {
+      if (type === 'category' && !businessId) {
+        return { ok: false, error: 'This request is not attached to a business.', changed }
+      }
+      if (type === 'area') {
+        patchRequest.city = city
+      }
+      if (businessId) patchBiz.city = city
+      changed.push(`city → *${city}*`)
+    }
+  }
+
+  if (fields.description) {
+    const description = fields.description.trim()
+    if (description.length < 2 || description.length > 600) {
+      return { ok: false, error: 'The description needs 2–600 characters.', changed }
+    }
+    if (!businessId) return { ok: false, error: 'This request is not attached to a business.', changed }
+    patchBiz.bio = description
+    changed.push('description updated')
+  }
+
+  if (Object.keys(patchRequest).length) {
+    await supabase.from('feature_requests').update(patchRequest).eq('id', id)
+  }
+  if (Object.keys(patchBiz).length && businessId) {
+    await supabase.from('businesses').update(patchBiz).eq('id', businessId)
+  }
+
+  return { ok: true, changed, name: requestName, categoryTarget: fields.category }
+}
+
 async function handleAdminCommand(from: string, text: string): Promise<boolean> {
   const clean = text.trim()
   const lower = clean.toLowerCase()
@@ -4056,22 +4222,44 @@ async function handleAdminCommand(from: string, text: string): Promise<boolean> 
   }
 
   // Waiting for the category name after *connect req* listed a single request:
-  // a plain reply is the target category, not a new command.
+  // a plain reply is the target category, not a new command. The reply can
+  // also carry rewrites, e.g. `category: Hardware name: Hardware & Tools`.
   const connectPending = adminSession?.data?.connectReqId as string | undefined
-  if (connectPending && /^[a-z][a-z &,'/-]{1,40}$/i.test(clean) && !/^(?:approve|reject|connect|requests?|reqs|pending|menu|help|cancel)\b/i.test(lower)) {
-    const result = await connectFeatureRequestToCategory(connectPending, clean)
-    if (result.ok) {
-      const next: ChatSessionData = { ...(adminSession?.data || {}) }
-      delete next.connectReqId
-      await saveSession(from, 'admin_requests', next)
-      await sendWhatsAppMessage(
-        from,
-        `🔗 *${result.alias}* → *${result.name}*. Filed under the existing category and remembered for future listings.\n\nType *requests* for the rest.`
-      )
-    } else {
-      await sendWhatsAppMessage(from, `⚠️ ${result.error || 'Could not connect that request.'}`)
+  const looksLikeAdminCommand = /^(?:approve|reject|connect|rewrite|edit|requests?|reqs|pending|menu|help|cancel)\b/i.test(lower)
+  if (connectPending && !looksLikeAdminCommand) {
+    const parsed = parseAdminRewrite(clean)
+    if (parsed.used || /^[a-z][a-z &,'/-]{1,40}$/i.test(clean)) {
+      let prefix = ''
+      if (parsed.used) {
+        const rewritten = await rewriteFeatureRequest(connectPending, parsed.fields)
+        if (!rewritten.ok) {
+          await sendWhatsAppMessage(from, `⚠️ ${rewritten.error || 'Could not rewrite that request.'}`)
+          return true
+        }
+        prefix = rewritePrefix(rewritten.changed)
+      }
+      const target = parsed.fields.category || parsed.bare
+      if (!target) {
+        await sendWhatsAppMessage(
+          from,
+          'Which existing category should it connect to? Add it as *category: <existing category>*.'
+        )
+        return true
+      }
+      const result = await connectFeatureRequestToCategory(connectPending, target)
+      if (result.ok) {
+        const next: ChatSessionData = { ...(adminSession?.data || {}) }
+        delete next.connectReqId
+        await saveSession(from, 'admin_requests', next)
+        await sendWhatsAppMessage(
+          from,
+          `${prefix}🔗 *${result.alias}* → *${result.name}*. Filed under the existing category and remembered for future listings.\n\nType *requests* for the rest.`
+        )
+      } else {
+        await sendWhatsAppMessage(from, `${prefix}⚠️ ${result.error || 'Could not connect that request.'}`)
+      }
+      return true
     }
-    return true
   }
 
   if (/^(?:add|list)\s+(?:a\s+)?(?:new\s+)?business$/.test(lower)) {
@@ -4737,7 +4925,12 @@ async function handleAdminCommand(from: string, text: string): Promise<boolean> 
       return true
     }
     await saveSession(from, 'admin_requests', { pendingReqs: rows.map(r => r.id) } as ChatSessionData)
-    await sendWhatsAppMessage(from, renderFeatureRequestList(rows, total))
+    await sendWhatsAppMessage(
+      from,
+      renderFeatureRequestList(rows, total) +
+        '\n\n✏️ Fix a typo or business detail first: *rewrite req 1 name: … business: … city: …*' +
+        '\nOr approve and rewrite in one line: *approve req 1 name: … category: …*'
+    )
     return true
   }
 
@@ -4747,23 +4940,97 @@ async function handleAdminCommand(from: string, text: string): Promise<boolean> 
   const reqConnect = clean.match(/^connect\s+(?:req(?:uest)?\s+)?(\d{1,2})(?:\s+(?:to|as)\s+|\s+)([\s\S]+)$/i)
   if (reqConnect) {
     const idx = Number(reqConnect[1]) - 1
-    const target = (reqConnect[2] || '').trim()
+    const rest = (reqConnect[2] || '').trim()
     const sess = await getSession(from)
     const ids = sess?.data.pendingCategoryReqs || sess?.data.pendingReqs || []
     if (idx < 0 || idx >= ids.length) {
       await sendWhatsAppMessage(from, 'Run *requests* first, then reply *connect req 1 <existing category>* with a list number.')
       return true
     }
+    const parsed = parseAdminRewrite(rest)
+    let prefix = ''
+    if (parsed.used) {
+      const rewritten = await rewriteFeatureRequest(ids[idx], parsed.fields)
+      if (!rewritten.ok) {
+        await sendWhatsAppMessage(from, `⚠️ ${rewritten.error || 'Could not rewrite that request.'}`)
+        return true
+      }
+      prefix = `✏️ ${rewriteSummary(rewritten.changed)}\n\n`
+    }
+    const target = parsed.fields.category || parsed.bare
+    if (!target) {
+      await sendWhatsAppMessage(
+        from,
+        'Which existing category should it connect to? Add it as *category: <existing category>*.'
+      )
+      return true
+    }
     const result = await connectFeatureRequestToCategory(ids[idx], target)
     if (!result.ok) {
-      await sendWhatsAppMessage(from, `⚠️ ${result.error || 'Could not connect that request.'}`)
+      await sendWhatsAppMessage(from, `${prefix}⚠️ ${result.error || 'Could not connect that request.'}`)
       return true
     }
     const remaining = ids.filter((id: string) => id !== ids[idx])
     await saveSession(from, 'admin_requests', { pendingReqs: remaining, pendingCategoryReqs: remaining } as ChatSessionData)
     await sendWhatsAppMessage(
       from,
-      `🔗 *${result.alias}* → *${result.name}*. Filed under the existing category and remembered for future listings. ${remaining.length} left in this list.`
+      `${prefix}🔗 *${result.alias}* → *${result.name}*. Filed under the existing category and remembered for future listings. ${remaining.length} left in this list.`
+    )
+    return true
+  }
+
+  // Edit a pending request (or the business behind it) without deciding yet.
+  // `category:` is the one field that also decides: it connects the request to
+  // that existing category, exactly like *connect req*.
+  const rewriteCmd = clean.match(/^(?:rewrite|edit)\s+req(?:uest)?\s+(\d{1,2})(?:\s+([\s\S]+))?$/i)
+  if (rewriteCmd) {
+    const idx = Number(rewriteCmd[1]) - 1
+    const rest = (rewriteCmd[2] || '').trim()
+    const sess = await getSession(from)
+    const ids = sess?.data.pendingReqs || []
+    if (idx < 0 || idx >= ids.length) {
+      await sendWhatsAppMessage(from, 'Run *requests* first, then reply *rewrite req 1 name: …* with a list number.')
+      return true
+    }
+    const parsed = parseAdminRewrite(rest)
+    if (!parsed.used) {
+      await sendWhatsAppMessage(
+        from,
+        [
+          '✏️ *Rewrite a request*',
+          '',
+          `Reply with one or more fields, e.g.`,
+          `*rewrite req ${idx + 1} name: Hardware & Tools business: Joe's Hardware city: Harare*`,
+          '',
+          'Fields: *name:* the requested category/area/city, *business:* the listing name,',
+          '*city:* the listing city, *description:* the listing bio, *category:* an existing category to connect to.',
+        ].join('\n')
+      )
+      return true
+    }
+    const rewritten = await rewriteFeatureRequest(ids[idx], parsed.fields)
+    if (!rewritten.ok) {
+      await sendWhatsAppMessage(from, `⚠️ ${rewritten.error || 'Could not rewrite that request.'}`)
+      return true
+    }
+    const prefix = rewritePrefix(rewritten.changed)
+    if (parsed.fields.category) {
+      const result = await connectFeatureRequestToCategory(ids[idx], parsed.fields.category)
+      if (!result.ok) {
+        await sendWhatsAppMessage(from, `${prefix}⚠️ ${result.error || 'Could not connect that request.'}`)
+        return true
+      }
+      const remaining = ids.filter((id: string) => id !== ids[idx])
+      await saveSession(from, 'admin_requests', { pendingReqs: remaining } as ChatSessionData)
+      await sendWhatsAppMessage(
+        from,
+        `${prefix}🔗 *${result.alias}* → *${result.name}*. Filed under the existing category and remembered for future listings. ${remaining.length} left in this list.`
+      )
+      return true
+    }
+    await sendWhatsAppMessage(
+      from,
+      `${prefix || `✏️ ${rewriteSummary(rewritten.changed)}.\n\n`}Still pending. Reply *approve req ${idx + 1}* to create it, or *connect req ${idx + 1} <existing category>* to file it under one.`
     )
     return true
   }
@@ -4792,6 +5059,7 @@ async function handleAdminCommand(from: string, text: string): Promise<boolean> 
       rows.length === 1
         ? 'Reply with the existing category, e.g. *Hardware* - or *connect req 1 Hardware*.'
         : 'Reply *connect req 1 <existing category>*, e.g. *connect req 1 Hardware*.',
+      'Fix the wording at the same time: *connect req 1 category: Hardware name: Hardware & Tools*.',
       'Type *requests* to see the full list, or *approve req 1* if it really is a new category.'
     )
     await sendWhatsAppMessage(from, lines.join('\n'))
@@ -4809,11 +5077,40 @@ async function handleAdminCommand(from: string, text: string): Promise<boolean> 
       await sendWhatsAppMessage(from, 'Run *requests* first, then reply *approve req 1* with a list number.')
       return true
     }
+
+    // `approve req 1 name: … business: …` rewrites the request/business first.
+    // `category:` turns the approval into a connect to that existing category.
+    const parsed = corrected ? parseAdminRewrite(corrected) : { fields: {}, bare: '', used: false }
+    let prefix = ''
+    if (op === 'approve' && parsed.used) {
+      const rewritten = await rewriteFeatureRequest(ids[idx], parsed.fields)
+      if (!rewritten.ok) {
+        await sendWhatsAppMessage(from, `⚠️ ${rewritten.error || 'Could not rewrite that request.'}`)
+        return true
+      }
+      prefix = `✏️ ${rewriteSummary(rewritten.changed)}\n\n`
+
+      if (parsed.fields.category) {
+        const connected = await connectFeatureRequestToCategory(ids[idx], parsed.fields.category)
+        if (!connected.ok) {
+          await sendWhatsAppMessage(from, `${prefix}⚠️ ${connected.error || 'Could not connect that request.'}`)
+          return true
+        }
+        const remaining = ids.filter((id: string) => id !== ids[idx])
+        await saveSession(from, 'admin_requests', { pendingReqs: remaining } as ChatSessionData)
+        await sendWhatsAppMessage(
+          from,
+          `${prefix}🔗 *${connected.alias}* → *${connected.name}*. Filed under the existing category and remembered for future listings. ${remaining.length} left in this list.`
+        )
+        return true
+      }
+    }
+
     const result = op === 'approve'
-      ? await approveFeatureRequestById(ids[idx], corrected)
+      ? await approveFeatureRequestById(ids[idx], parsed.used ? undefined : (parsed.bare || corrected))
       : await rejectFeatureRequestById(ids[idx])
     if (!result.ok) {
-      await sendWhatsAppMessage(from, `⚠️ ${result.error || 'Could not update that request.'}`)
+      await sendWhatsAppMessage(from, `${prefix}⚠️ ${result.error || 'Could not update that request.'}`)
       return true
     }
     const remaining = ids.filter((id: string) => id !== ids[idx])
@@ -4821,7 +5118,7 @@ async function handleAdminCommand(from: string, text: string): Promise<boolean> 
     const verb = op === 'approve' ? 'approved' : 'rejected'
     await sendWhatsAppMessage(
       from,
-      `${op === 'approve' ? '✅' : '✖'} *${result.name}* (${result.type}) ${verb}. ${remaining.length} left in this list.\nSend *requests* for the next page.`
+      `${prefix}${op === 'approve' ? '✅' : '✖'} *${result.name}* (${result.type}) ${verb}. ${remaining.length} left in this list.\nSend *requests* for the next page.`
     )
     return true
   }
