@@ -10,8 +10,10 @@ const MAX_MEDIA_BYTES = 20 * 1024 * 1024
 // this so the request stays inside the inline limit.
 const MAX_ANALYZE_BYTES = 13 * 1024 * 1024
 
-// ── Rate limit: 3 AI media recognitions per phone per hour ───────────────
-const RATE_LIMIT = 3
+// ── Rate limit: 5 AI media recognitions per phone per hour ───────────────
+// More room for a retry when a photo is blurry. Registration business-card
+// reads run before this check and are governed by the shared AI budget.
+const RATE_LIMIT = 5
 const RATE_WINDOW_MS = 60 * 60 * 1000
 const rateBuckets = new Map<string, number[]>()
 

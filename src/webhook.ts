@@ -24,6 +24,7 @@ import type { Business } from '@wa-directory/shared'
 import {
   getConversationState,
   setConversationState,
+  updateConversationContext,
   clearConversationState,
   handleRegistrationMessage,
   handleRegistrationImage,
@@ -1693,6 +1694,156 @@ async function sendRegisterChoice(from: string) {
   await startImageFirstRegister(from)
 }
 
+// ── Registration review: edit without typing "proceed" ───────────────────
+// The shared flow's OCR review used to reply "type proceed" after one edit.
+// Owners should see the updated listing again with Publish and Edit buttons,
+// so a correction never costs them another command.
+type RegistrationReviewEdit = { key: string; label: string; value: string }
+
+function parseRegistrationReviewEdit(text: string): RegistrationReviewEdit | null {
+  const m = text.match(/^(?:edit\s+)?([A-Za-z][A-Za-z ]{2,20}?)\s*:\s*([\s\S]+)$/i)
+  if (!m) return null
+  const label = m[1].trim().toLowerCase()
+  const value = m[2].trim()
+  if (!value || value.length > 400) return null
+  if (label.includes('call') || label.includes('telephone')) return { key: 'calls', label: 'Calls number', value }
+  if (label.includes('name')) return { key: 'business_name', label: 'Business name', value }
+  if (label.includes('categor')) return { key: 'category', label: 'Category', value }
+  if (label.includes('city') || label.includes('town')) return { key: 'city', label: 'City', value }
+  if (label.includes('phone') || label.includes('whatsapp') || label.includes('number')) return { key: 'phone', label: 'WhatsApp number', value }
+  if (label.includes('description') || label.includes('offer') || label.includes('bio')) return { key: 'description', label: 'Description', value }
+  if (label.includes('website') || label.includes('site')) return { key: 'website', label: 'Website', value }
+  if (label.includes('address')) return { key: 'address', label: 'Physical address', value }
+  if (label.includes('area') || label.includes('suburb')) return { key: 'area', label: 'Area', value }
+  if (label.includes('price')) return { key: 'price_range', label: 'Price range', value }
+  return null
+}
+
+function registrationField(fields: Record<string, { value?: string } | undefined> | undefined, key: string): string {
+  return (fields?.[key]?.value || '').toString().trim()
+}
+
+function buildRegistrationListing(fields: Record<string, { value?: string } | undefined> | undefined) {
+  return {
+    name: registrationField(fields, 'business_name'),
+    categories: [registrationField(fields, 'category') || 'Other'],
+    city: registrationField(fields, 'city'),
+    phone: registrationField(fields, 'phone'),
+    area: registrationField(fields, 'area'),
+    description: registrationField(fields, 'description'),
+    website: registrationField(fields, 'website'),
+    address: registrationField(fields, 'address'),
+    calls: registrationField(fields, 'calls'),
+    priceRange: registrationField(fields, 'price_range'),
+    requestedCategory: registrationField(fields, 'requested_category'),
+    notify: false,
+  }
+}
+
+async function applyRegistrationReviewEdit(from: string, context: any, edit: RegistrationReviewEdit) {
+  const fields = { ...(context.fields || {}) }
+  fields[edit.key] = { value: edit.value, confidence: 1, status: 'suggested' }
+  if (edit.key === 'category') fields.requested_category = fields[edit.key]
+  const listing = buildRegistrationListing(fields)
+  await updateConversationContext(from, { fields, listing })
+  return { fields, listing }
+}
+
+function registrationReviewLines(context: any): string[] {
+  const fields = context.fields || {}
+  const rows: Array<[string, string]> = [
+    ['Name', registrationField(fields, 'business_name')],
+    ['Category', registrationField(fields, 'category')],
+    ['City', registrationField(fields, 'city')],
+    ['Phone', registrationField(fields, 'phone')],
+    ['Calls', registrationField(fields, 'calls')],
+    ['Area', registrationField(fields, 'area')],
+    ['Description', registrationField(fields, 'description')],
+    ['Website', registrationField(fields, 'website')],
+    ['Address', registrationField(fields, 'address')],
+    ['Prices', registrationField(fields, 'price_range')],
+  ]
+  const described = registrationField(fields, 'requested_category')
+  const lines = rows.filter(([, value]) => value).map(([label, value]) => `✓ ${label}: ${value}`)
+  if (described) lines.push(`· Category you described: ${described} (our team confirms this)`)
+  if (context.password) lines.push('✓ Portal password: set')
+  return lines
+}
+
+async function sendRegistrationReview(
+  from: string,
+  context: any,
+  opts: { updated?: string; hint?: string } = {}
+) {
+  const step = context?.step === 'final_review' ? 'final_review' : 'review_extracted'
+  const lines = registrationReviewLines(context)
+  const body = [
+    opts.updated || '',
+    '🏪 *Your listing — Ready to publish*',
+    '',
+    ...lines,
+    '',
+    opts.hint || 'Reply `City: Bulawayo` to change a detail (or `edit City: Bulawayo`).',
+  ]
+    .filter((line, i, all) => line || all[i - 1])
+    .join('\n')
+  const buttons: InteractiveButton[] =
+    step === 'final_review'
+      ? [
+          { id: 'reg_publish', title: '🚀 Publish listing' },
+          { id: 'reg_edit', title: '✏️ Edit details' },
+          { id: 'reg_cancel', title: '✖ Cancel' },
+        ]
+      : [
+          { id: 'reg_review_publish', title: '🚀 Publish listing' },
+          { id: 'reg_edit', title: '✏️ Edit details' },
+        ]
+  if (body.length <= 1000) {
+    await sendInteractiveButtons(from, body, buttons)
+  } else {
+    await sendWhatsAppMessage(from, body)
+    await sendInteractiveButtons(from, 'Ready to publish?', buttons)
+  }
+}
+
+async function publishRegistrationReview(from: string, state: any) {
+  const context = state?.context || {}
+  if (context.step !== 'review_extracted') return
+  const fields = context.fields || {}
+  const listing = buildRegistrationListing(fields)
+  const finalContext = { ...context, step: 'final_review', fields, listing }
+  const saved = await setConversationState(from, 'REGISTRATION_FINAL_REVIEW', finalContext)
+  if (!saved) {
+    await sendWhatsAppMessage(from, '⚠️ Something went wrong saving your listing. Send *register* to start again.')
+    return
+  }
+  await handleRegistrationMessage(from, 'publish', finalContext)
+}
+
+async function handleRegistrationReviewText(from: string, text: string, state: any): Promise<boolean> {
+  const context = state?.context || {}
+  const step = context.step
+  if (step !== 'review_extracted' && step !== 'final_review') return false
+  const lower = text.trim().toLowerCase()
+  if (lower === 'edit' || lower === 'reg_edit') {
+    await sendRegistrationReview(from, context, {
+      hint: '✏️ Type the detail you want to change, e.g. `City: Bulawayo`.',
+    })
+    return true
+  }
+  // The shared flow owns password validation; let it keep that path.
+  if (step === 'final_review' && /^(?:edit\s+)?password\s*:/i.test(text)) return false
+  const edit = parseRegistrationReviewEdit(text)
+  if (!edit) return false
+  const { fields, listing } = await applyRegistrationReviewEdit(from, context, edit)
+  await sendRegistrationReview(
+    from,
+    { ...context, fields, listing },
+    { updated: `✅ Updated *${edit.label}* to: ${edit.value}` }
+  )
+  return true
+}
+
 // Personal contact intake: the whole draft is ONE message —
 // "Tendai Ncube 0771 234 567 Harare IG @tendai tiktok.com/@tendai". Deliberately
 // simpler than the business form: name, phone, optional city, up to 3 socials.
@@ -2593,7 +2744,7 @@ async function handleOrderPhotoReply(
     return
   }
   if (!mediaRateOk(from)) {
-    await sendWhatsAppMessage(from, 'You can send at most 3 photos per hour. Try again a little later.', mediaMsgId)
+    await sendWhatsAppMessage(from, 'You can send at most 5 photos per hour. Try again a little later.', mediaMsgId)
     return
   }
   void markRead(mediaMsgId, true).catch(() => {})
@@ -2742,7 +2893,7 @@ async function handleBotMedia(
   if (!mediaRateOk(from)) {
     await sendWhatsAppMessage(
       from,
-      'You can send at most 3 voice or photo tries per hour to keep things quick. Send it as text and I keep working.',
+      'You can send at most 5 voice or photo tries per hour to keep things quick. Send it as text and I keep working.',
       mediaMsgId
     )
     return
@@ -5449,6 +5600,23 @@ async function handleAdminCommand(from: string, text: string): Promise<boolean> 
 }
 
 async function handleAction(from: string, session: ChatSession | null, action: string, msgId?: string) {
+  // Registration review buttons: Edit reopens the same ready-to-publish card,
+  // and Publish from the OCR review submits without a second "proceed" step.
+  if (action === 'reg_review_publish' || action === 'reg_edit') {
+    const conv = await getConversationState(from)
+    const step = conv?.context?.step
+    if (conv && (step === 'review_extracted' || step === 'final_review')) {
+      if (action === 'reg_review_publish' && step === 'review_extracted') {
+        await publishRegistrationReview(from, conv)
+      } else {
+        await sendRegistrationReview(from, conv.context, {
+          hint: '✏️ Type the detail you want to change, e.g. `City: Bulawayo`.',
+        })
+      }
+      return
+    }
+  }
+
   // ── #1 bidding callbacks (business owners) ───────────────────────────
   // The amount buttons carry the full scope in the id, so no stored state.
   if (action.startsWith('bid_biz_')) {
@@ -8769,6 +8937,9 @@ export async function POST(request: Request) {
               continue
             }
           }
+          // Keep the owner on the review card after an edit instead of
+          // making them type *proceed* to see their updated listing again.
+          if (await handleRegistrationReviewText(from, text, convState)) continue
           await handleRegistrationMessage(from, text, convState.context)
           continue
         }
