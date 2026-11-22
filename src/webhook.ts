@@ -2169,14 +2169,16 @@ function cleanDescription(raw: string): string {
 }
 
 /** Parse a seller's answer to "what is the price of the stove?".
- * A marked amount ($50, 50$, 50 usd, price 50) wins; otherwise any numeral is
- * taken as the price (last one when several appear) and the remaining words
- * become the description ("black 50" → 50, "black"). Pure text is a
+ * Only a marked amount ($50, 50$, 50 usd, price 50) or a reply that is just
+ * the number ("50") is a price. A number inside descriptive text ("black 50",
+ * "500 ml") is ambiguous - it may be a size or model - so it is kept as the
+ * description and the bot asks for the price again. Pure text is a
  * description and leaves the price unset. */
 function parsePriceReply(text: string):
   | { kind: 'price'; value: number; description?: string }
   | { kind: 'skip' }
-  | { kind: 'description'; text: string } {
+  | { kind: 'description'; text: string }
+  | { kind: 'ambiguous'; text: string } {
   const t = text.trim()
   if (!t) return { kind: 'description', text: '' }
   if (/^(?:skip|no|none|no price|n\/?a|free|not selling|can'?t say)$/i.test(t)) return { kind: 'skip' }
@@ -2184,24 +2186,25 @@ function parsePriceReply(text: string):
   const money = String.raw`\d[\d.,]*`
   const marked = t.match(
     new RegExp(
-      String.raw`\$\s*(${money})|(${money})\s*\$|\b(?:usd|us\$)\s*(${money})|(${money})\s*(?:usd|dollars?|bucks?)\b|\bprice(?:\s*is|\s*:)?\s*\$?\s*(${money})`,
+      String.raw`\$\s*(${money})|(${money})\s*\$|\b(?:usd|us\$)\s*(${money})|(${money})\s*(?:usd|dollars?|bucks?|each)\b|\bprice(?:\s*is|\s*:)?\s*\$?\s*(${money})`,
       'i'
     )
   )
   const markedValue = marked ? normaliseMoney(marked.slice(1).find(Boolean) || '') : null
+  if (marked) {
+    if (markedValue == null) return { kind: 'description', text: t }
+    const description = cleanDescription(t.replace(marked[0], ' '))
+    return { kind: 'price', value: markedValue, description: description || undefined }
+  }
 
-  // Any other numeral still answers an explicit price question. Prefer the
-  // last amount ("2 for 50" → 50, "black 4 plate 50" → 50).
-  const numbers = [...t.matchAll(/\d[\d.,]*/g)]
-  const candidate = markedValue ?? (numbers.length ? normaliseMoney(numbers[numbers.length - 1][0]) : null)
-  if (candidate == null) return { kind: 'description', text: t }
-
-  const last = numbers[numbers.length - 1]
-  const withoutPrice = marked
-    ? t.replace(marked[0], ' ')
-    : `${t.slice(0, last.index)} ${t.slice(last.index + last[0].length)}`
-  const description = cleanDescription(withoutPrice)
-  return { kind: 'price', value: candidate, description: description || undefined }
+  // A bare amount answers the question directly. Anything else that contains a
+  // number is not safe to read as a price - "black 50" could be a 500ml size.
+  if (/^\d[\d.,]*$/.test(t)) {
+    const value = normaliseMoney(t)
+    if (value != null) return { kind: 'price', value }
+  }
+  if (/\d/.test(t)) return { kind: 'ambiguous', text: t }
+  return { kind: 'description', text: t }
 }
 
 function batchSummaryLines(items: ShelfBatchItem[]): string[] {
@@ -2403,8 +2406,8 @@ async function askNextShelfPrice(from: string, batch: ItemBatch, msgId?: string)
         `💰 *What is the price of the ${item.name}?*`,
         ...(item.description ? ['', `> ${item.description}`] : []),
         '',
-        'Reply a number like *50*, *$50* or *10 usd*, or tap *Skip*.',
-        'Words you add are kept as the item description.',
+        'Reply the amount on its own like *50*, or mark it as *$50* or *10 usd*.',
+        'A number inside a sentence is kept as description, not taken as the price.',
       ].join('\n'),
       [
         { id: 'itembatch_skip', title: '⏭ Skip price' },
@@ -2470,6 +2473,23 @@ async function handleBatchPriceReply(from: string, session: ChatSession, text: s
         ...(target.description ? [`> ${target.description}`] : []),
       ].join('\n')
     )
+  } else if (parsed.kind === 'ambiguous') {
+    // Keep the words (and the number) as description, but do not treat the
+    // number as a price. Ask the same item again.
+    target.description = mergeDescription(target.description, parsed.text)
+    await sendWhatsAppMessage(
+      from,
+      [
+        `📝 Saved as a description for *${target.name}*:`,
+        `> ${target.description}`,
+        '',
+        'I still need the price. Reply the amount on its own (e.g. *50*), or tap *Skip*.',
+      ].join('\n')
+    )
+    const retry: ItemBatch = { ...batch, items, asking: idx }
+    await saveSession(from, 'item_batch', { itemBatch: retry })
+    await askNextShelfPrice(from, retry)
+    return true
   } else if (parsed.kind === 'skip') {
     target.priceSkipped = true
     await sendWhatsAppMessage(from, `⏭ *${target.name}* - price skipped.`)

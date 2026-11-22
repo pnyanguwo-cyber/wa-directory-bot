@@ -100,14 +100,17 @@ export function parseMoney(raw: string): number | null {
   return Number.isFinite(value) && value > 0 ? value : null
 }
 
-// A caption carries a price only when it is explicitly marked: "$50", "50$",
-// "50 usd", "usd 50", or "price 50". A bare number ("black 50") stays text.
+// A caption carries a price when it is a standalone amount ("50") or is
+// explicitly marked: "$50", "50$", "50 usd", "usd 50", "price 50". A number
+// inside descriptive text ("stove black 50", "500 ml") stays text because it
+// could be a size or model, not the price.
 const AMOUNT = String.raw`\d[\d.,]*`
 const CAPTION_PRICE_PATTERNS: RegExp[] = [
+  new RegExp(String.raw`^\s*(${AMOUNT})\s*$`),
   new RegExp(String.raw`\$\s*(${AMOUNT})`, 'i'),
   new RegExp(String.raw`(${AMOUNT})\s*\$`),
   new RegExp(String.raw`\b(?:usd|us\$)\s*(${AMOUNT})`, 'i'),
-  new RegExp(String.raw`(${AMOUNT})\s*(?:usd|dollars?|bucks?)\b`, 'i'),
+  new RegExp(String.raw`(${AMOUNT})\s*(?:usd|dollars?|bucks?|each)\b`, 'i'),
   new RegExp(String.raw`\bprice(?:\s*is|\s*:)?\s*\$?\s*(${AMOUNT})`, 'i'),
 ]
 
@@ -163,8 +166,8 @@ export async function recognizeShelfItems(
     `The description is the visible detail buyers would search for: colour, material, size, plates, condition, etc. ` +
     `Write it as short comma-separated attributes, e.g. a black four-plate stove is name "stove" with description "black, 4 plate". ` +
     `Add the seller's own caption details (delivery, customisation, condition) when present, but never repeat the price there.\n` +
-    `PRICE RULE: a price is allowed ONLY when the caption has an explicit $, usd, or "price" marker, or a price is clearly written on the item. ` +
-    `A bare number in the caption is part of the description, not a price.\n` +
+    `PRICE RULE: a price is allowed ONLY when the caption is just a number, has an explicit $, usd, or "price" marker, or a price is clearly written on the item. ` +
+    `A number inside descriptive caption text (e.g. "stove black 50" or "500 ml") stays in the description, not the price.\n` +
     `Reply ONLY with a JSON object: {"items":[{"name":"<product name>","price":<number or null>,"description":"<short comma-separated description or empty>"}]}. No markdown.`
 
   const parts: GeminiPart[] = [
