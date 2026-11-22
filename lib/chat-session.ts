@@ -144,6 +144,9 @@ export interface ShelfBatchItem {
   price: number | null
   description?: string
   imageUrl: string
+  // True when the AI did not identify a usable product name; the seller is
+  // asked for the name before the price.
+  nameUnknown?: boolean
   // True once the seller has skipped the price question for this item.
   priceSkipped?: boolean
 }
@@ -166,6 +169,8 @@ export interface ItemBatch {
   batchToken?: string
   // Index of the item whose price is currently being asked.
   asking?: number
+  // True when the current question is for the item's name, not its price.
+  askingName?: boolean
 }
 
 // One item in the cross-business chat cart.

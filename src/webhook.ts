@@ -2677,19 +2677,22 @@ async function handleShelfBatchImage(
   }
 
   const index = (base?.items.length || 0) + 1
+  const captionName = stripPriceFromCaption(caption)
   const fallback: ShelfBatchItem = {
-    name: (stripPriceFromCaption(caption) || `Item ${index}`).slice(0, 60),
+    name: (captionName || `Item ${index}`).slice(0, 60),
     price: priceFromCaption(caption),
     imageUrl,
+    nameUnknown: !captionName,
   }
   const found = recognised && recognised.length ? recognised : [fallback]
   const items: ShelfBatchItem[] = [
     ...(base?.items || []),
     ...found.map(f => ({
-      name: f.name || 'Item',
+      name: f.name || 'Unnamed item',
       price: f.price ?? null,
       description: f.description || undefined,
       imageUrl,
+      nameUnknown: f.nameUnknown,
     })),
   ]
   const imageCount = (base?.imageCount || 0) + 1
@@ -2779,9 +2782,24 @@ async function finalizeShelfBatch(from: string, session: ChatSession, msgId?: st
 async function askNextShelfPrice(from: string, batch: ItemBatch, msgId?: string) {
   const idx = batch.items.findIndex(i => i.price == null && !i.priceSkipped)
   if (idx >= 0) {
-    const next: ItemBatch = { ...batch, phase: 'pricing', asking: idx }
-    await saveSession(from, 'item_batch', { itemBatch: next })
     const item = batch.items[idx]
+    if (item.nameUnknown || !item.name.trim()) {
+      const next: ItemBatch = { ...batch, phase: 'pricing', asking: idx, askingName: true }
+      await saveSession(from, 'item_batch', { itemBatch: next })
+      await sendWhatsAppMessage(
+        from,
+        [
+          `📝 *What is this item called?*`,
+          ...(item.description ? [`> ${item.description}`] : []),
+          '',
+          'The photo did not give me a clear product name. Reply the name, or *skip* to keep "Unnamed item".',
+        ].join('\n'),
+        msgId
+      )
+      return
+    }
+    const next: ItemBatch = { ...batch, phase: 'pricing', asking: idx, askingName: false }
+    await saveSession(from, 'item_batch', { itemBatch: next })
     await sendInteractiveButtons(
       from,
       [
@@ -2840,9 +2858,33 @@ async function handleBatchPriceReply(from: string, session: ChatSession, text: s
   const item = batch.items[idx]
   if (!item) return false
 
-  const parsed = parsePriceReply(text)
   const items = batch.items.map((row, i) => (i === idx ? { ...row } : row))
   const target = items[idx]
+
+  if (batch.askingName) {
+    const trimmed = text.trim()
+    if (/^skip$/i.test(trimmed)) {
+      target.name = target.name || 'Unnamed item'
+      target.nameUnknown = false
+    } else if (/^(?:done|finish(?:ed)?|that'?s all|no more|ready|continue|submit)$/i.test(trimmed)) {
+      target.name = target.name && target.name !== 'Unnamed item' ? target.name : `Item ${idx + 1}`
+      target.nameUnknown = false
+    } else if (trimmed) {
+      target.name = trimmed.slice(0, 80)
+      target.nameUnknown = false
+    } else {
+      await sendWhatsAppMessage(from, `Please reply the product name, or *skip*.`)
+      const retry: ItemBatch = { ...batch, items, asking: idx, askingName: true }
+      await saveSession(from, 'item_batch', { itemBatch: retry })
+      return true
+    }
+    const next: ItemBatch = { ...batch, items, asking: idx, askingName: false }
+    await saveSession(from, 'item_batch', { itemBatch: next })
+    await askNextShelfPrice(from, next)
+    return true
+  }
+
+  const parsed = parsePriceReply(text)
 
   if (parsed.kind === 'price') {
     target.price = parsed.value

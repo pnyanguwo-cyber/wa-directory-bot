@@ -79,6 +79,7 @@ export interface ShelfRecognition {
   name: string
   price: number | null
   description: string
+  nameUnknown?: boolean
 }
 
 
@@ -197,9 +198,12 @@ export async function recognizeShelfItems(
       // price marker cannot be a price, even if the model guessed one.
       if (caption && caption.trim() && captionPrice == null) price = null
       if (captionPrice != null) price = captionPrice
+      const aiName = str('name')
+      const nameUnknown = !aiName || /^item(?:\s*\d+)?$/i.test(aiName)
       out.push({
-        name: (str('name') || 'Item').slice(0, 80),
+        name: (nameUnknown ? 'Unnamed item' : aiName).slice(0, 80),
         price,
+        nameUnknown,
         // The model sometimes echoes the price into the description; a
         // description must never look like a second price.
         description: str('description')
