@@ -21,7 +21,13 @@ import { logBotMessage, logBotSearch } from '@wa-directory/shared'
 import { orderSearchResults } from '@wa-directory/shared'
 import { expandSearchQuery, classifyIntent } from '@wa-directory/shared'
 import type { Business } from '@wa-directory/shared'
-import { getConversationState, clearConversationState } from '@wa-directory/shared'
+import {
+  getConversationState,
+  setConversationState,
+  clearConversationState,
+  handleRegistrationMessage,
+  handleRegistrationImage,
+} from '@wa-directory/shared'
 import { TRIAL_PLAN_LABEL, TRIAL_DAYS } from '@wa-directory/shared'
 import {
   getSession,
@@ -1652,13 +1658,39 @@ async function resumePaused(from: string, session: ChatSession | null): Promise<
   }
 }
 
-// ✎ Register goes straight into the business questions. The old
-// trial-vs-paid plan screen and the personal-contact option were removed to
-// give owners a single, short hop-in path.
-async function sendRegisterChoice(from: string) {
+// ✎ Register goes straight to the image-first step: send a business card or
+// enter the details manually. The plan/trial choice and the personal-contact
+// option are deliberately skipped.
+async function startImageFirstRegister(from: string) {
   await clearSession(from)
   await clearConversationState(from)
-  await startRegister(from)
+  const saved = await setConversationState(from, 'REGISTRATION_AWAITING_IMAGE', {
+    step: 'choose_material',
+    approvedPlan: 'trial',
+    trialRequested: true,
+  })
+  if (!saved) {
+    await sendWhatsAppMessage(
+      from,
+      '⚠️ Something went wrong starting registration. Please send *register* again.'
+    )
+    return
+  }
+  await sendInteractiveButtons(
+    from,
+    "🏪 *Let's get your business listed!*\n\n" +
+      'Have a business card, flyer, banner or advert? Send us a picture and our AI ' +
+      'will extract the business information it can identify, saving you time.\n\n' +
+      'You can also skip this step and enter your details manually.',
+    [
+      { id: 'reg_upload', title: '📷 Send a picture' },
+      { id: 'reg_skip', title: 'Skip and enter manually' },
+    ]
+  )
+}
+
+async function sendRegisterChoice(from: string) {
+  await startImageFirstRegister(from)
 }
 
 // Personal contact intake: the whole draft is ONE message —
@@ -2671,14 +2703,28 @@ async function handleBotMedia(
     return
   }
 
-  // The old image-first registration flow is retired. If a stale shared
-  // registration state is still open, clear it and start the short manual
-  // wizard instead of processing a business-card photo.
   const convState = await getConversationState(from)
-  if (convState && convState.state.startsWith('REGISTRATION_')) {
-    await clearConversationState(from)
-    await sendWhatsAppMessage(from, "Let's list your business - I'll ask a few quick questions.", mediaMsgId)
-    await startRegister(from)
+  if (convState && convState.state.startsWith('REGISTRATION_') && kind === 'image') {
+    // A leftover plan-choice state must not stop the photo from being read.
+    if (convState.state === 'REGISTRATION_STARTED' || convState.context?.step === 'choose_plan') {
+      await setConversationState(from, 'REGISTRATION_AWAITING_IMAGE', {
+        step: 'choose_material',
+        approvedPlan: 'trial',
+        trialRequested: true,
+      })
+    }
+    const media = await fetchWhatsAppMedia(mediaId)
+    if (media) {
+      console.log(`[bot-media] registration photo routed to extraction (${from})`)
+      await handleRegistrationImage(from, new Uint8Array(media.buffer), caption)
+    } else {
+      console.warn(`[bot-media] registration photo download failed (${from}, ${mediaId})`)
+      await sendWhatsAppMessage(
+        from,
+        "I couldn't download that picture. Send it again as a photo, or reply *skip* to continue without one.",
+        mediaMsgId
+      )
+    }
     return
   }
 
@@ -3276,8 +3322,9 @@ async function handlePaySearchText(from: string, session: ChatSession, text: str
     if (!trailing || /^(?:me|my business|my company|my shop|myself|us)$/i.test(trailing)) {
       await sendRegisterChoice(from)
     } else {
-      // User typed something like "register my bakery" - start with the new flow
-      await startRegister(from)
+      // User typed something like "register my bakery" - open the
+      // photo/manual step and collect the details from there.
+      await startImageFirstRegister(from)
     }
     return
   }
@@ -3996,7 +4043,7 @@ async function handleAdminCommand(from: string, text: string): Promise<boolean> 
       return true
     }
     await resetForNewSearch(from, adminSession)
-    await startRegister(owner)
+    await startImageFirstRegister(owner)
     await sendWhatsAppMessage(
       from,
       [
@@ -5711,9 +5758,7 @@ async function handleAction(from: string, session: ChatSession | null, action: s
       return
     }
     case 'menu_register': {
-      // The new flow handles resume via Supabase state automatically.
-      // Just start the registration flow - it will detect and resume any in-progress registration.
-      await startRegister(from)
+      await startImageFirstRegister(from)
       return
     }
     case 'resume_paused': {
@@ -5726,7 +5771,7 @@ async function handleAction(from: string, session: ChatSession | null, action: s
       await sendRegisterChoice(from)
       return
     case 'reg_business':
-      await startRegister(from)
+      await startImageFirstRegister(from)
       return
     // Personal contacts were removed from sign-up. Old buttons still land
     // here, so they now begin a business listing instead of a dead end.
@@ -5747,7 +5792,7 @@ async function handleAction(from: string, session: ChatSession | null, action: s
       if (session?.step === 'list_form') {
         await tryPublishForm(from, session, msgId)
       } else {
-        await startRegister(from)
+        await startImageFirstRegister(from)
       }
       return
     }
@@ -5757,7 +5802,7 @@ async function handleAction(from: string, session: ChatSession | null, action: s
         await saveSession(from, 'list_form', { ...session.data, list: before, wizard: 0 } as ChatSessionData)
         await sendWizardQuestion(from, before, 0, "Let's go through your answers again - *Skip* anything you want to keep.")
       } else {
-        await startRegister(from)
+        await startImageFirstRegister(from)
       }
       return
     }
@@ -5800,8 +5845,7 @@ async function handleAction(from: string, session: ChatSession | null, action: s
       await startPaySearch(from)
       return
     case 'pay_new':
-      await clearSession(from)
-      await startRegister(from)
+      await startImageFirstRegister(from)
       return
     case 'pay_1m':
     case 'pay_6m':
@@ -5814,10 +5858,12 @@ async function handleAction(from: string, session: ChatSession | null, action: s
       await clearSession(from)
       await sendWhatsAppMessage(from, CANCEL_TEXT)
       return
-    // Old image-first registration buttons. That flow is retired, so every
-    // one of them now opens the short manual wizard (cancel still cancels).
+    // Image-first registration buttons. The plan/trial buttons no longer
+    // appear, but old messages may still carry them - treat them as "register".
     case 'reg_plan_trial':
     case 'reg_plan_paid':
+      await startImageFirstRegister(from)
+      return
     case 'reg_upload':
     case 'reg_skip':
     case 'reg_proceed':
@@ -5825,10 +5871,17 @@ async function handleAction(from: string, session: ChatSession | null, action: s
     case 'reg_edit':
     case 'reg_talk_admin':
     case 'reg_ask_admin_permission':
-    case 'reg_change_phone':
-      await startRegister(from)
+    case 'reg_change_phone': {
+      const convState = await getConversationState(from)
+      if (convState && convState.state.startsWith('REGISTRATION_')) {
+        await handleRegistrationMessage(from, action, convState.context)
+        return
+      }
+      await startImageFirstRegister(from)
       return
+    }
     case 'reg_cancel':
+      await clearConversationState(from)
       await clearSession(from)
       await sendWhatsAppMessage(from, CANCEL_TEXT)
       return
@@ -8378,31 +8431,48 @@ export async function POST(request: Request) {
 
         const convState = await getConversationState(from)
         if (convState && convState.state.startsWith('REGISTRATION_')) {
-          // The old image-first registration flow is retired. Clear whatever
-          // stale shared state is left and continue with the short manual
-          // wizard. A first answer typed here seeds the wizard; the old
-          // buttons (skip/manual/register) do not become the business name.
-          await clearConversationState(from)
-          const t = text.trim()
-          if (/^(?:cancel|stop|quit)$/i.test(t)) {
-            await clearSession(from)
-            await sendWhatsAppMessage(from, CANCEL_TEXT)
+          // A fresh register command replaces any in-progress registration
+          // with the photo/manual prompt.
+          if (registrationCommand(text)) {
+            await startImageFirstRegister(from)
             continue
           }
-          if (/^help$/i.test(t)) {
-            await sendWhatsAppMessage(from, await helpText(from))
+          // "resume" is not an answer to a registration question.
+          if (resumeAsk) {
+            await sendWhatsAppMessage(
+              from,
+              '📝 Your registration is still open - answer the last question above to carry on, or send *cancel* to stop.\n\nType *menu* for everything else.'
+            )
             continue
           }
-          if (/^menu$/i.test(t)) {
-            await sendMainMenu(from)
+          // Never re-open the old trial/paid plan screen. A stale state still
+          // sitting on it moves to the photo/manual prompt instead.
+          if (
+            convState.state === 'REGISTRATION_STARTED' ||
+            convState.context?.step === 'choose_plan' ||
+            convState.context?.step === 'flow_active'
+          ) {
+            await startImageFirstRegister(from)
             continue
           }
-          const seed = /^(?:hi|hello|hey|hie|howdy|skip|manual|enter manually|register|start|resume|continue)\b/i.test(
-            t
-          )
-            ? ''
-            : text
-          await startRegister(from, seed)
+          // At the photo/manual prompt, anything that is not one of the two
+          // choices re-sends our prompt. Without this guard the shared handler
+          // falls back to its old "You chose: free trial" message.
+          if (
+            convState.context?.step === 'choose_material' ||
+            convState.context?.step === 'awaiting_photo'
+          ) {
+            const choice = text.trim().toLowerCase()
+            if (
+              !/^(?:skip|manual|enter manually|reg_skip|send picture|picture|photo|upload|reg_upload)$/i.test(
+                choice
+              )
+            ) {
+              await startImageFirstRegister(from)
+              continue
+            }
+          }
+          await handleRegistrationMessage(from, text, convState.context)
           continue
         }
 
@@ -8827,6 +8897,10 @@ export async function POST(request: Request) {
 
         // ── Living list-form: parse + re-render after every reply ──────
         if (session?.step === 'list_form') {
+          if (registrationCommand(text)) {
+            await startImageFirstRegister(from)
+            continue
+          }
           if (lower === 'cancel' || lower === 'help') {
             await clearSession(from)
             await sendWhatsAppMessage(from, lower === 'cancel' ? CANCEL_TEXT : await helpText(from))
@@ -8952,9 +9026,8 @@ export async function POST(request: Request) {
           if (regCommand === 'choice') {
             await sendRegisterChoice(from)
           } else {
-            // The message already names a business (or a supplier/shop), so
-            // skip the business-vs-personal question and open the form.
-            await startRegister(from)
+            // Open the photo/manual step instead of the old plan screen.
+            await startImageFirstRegister(from)
           }
           continue
         }
