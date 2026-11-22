@@ -80,7 +80,7 @@ import { getBotSetting, setBotSetting } from '@wa-directory/shared'
 import { getAiLimitStatus, renderAiLimitNotice } from '@wa-directory/shared'
 import { createListing } from '@wa-directory/shared'
 import { uploadLogoImage } from '@wa-directory/shared'
-import { fetchWhatsAppMedia, perceiveMedia, mediaRateOk, recognizeShelfItems, priceFromCaption, type MediaKind, type MediaSense } from '../lib/bot-sense.js'
+import { fetchWhatsAppMedia, perceiveMedia, mediaRateOk, recognizeShelfItems, priceFromCaption, stripPriceFromCaption, parseMoney, type MediaKind, type MediaSense } from '../lib/bot-sense.js'
 import { renderSocialReply } from '../lib/social-intent.js'
 import { semanticPhotoHint, type SemanticHint } from '../lib/semantic-search.js'
 import {
@@ -277,7 +277,19 @@ async function helpText(from?: string): Promise<string> {
     ? SUPPLIER_HELP_LINES(siteUrl, channelUrl)
     : FALLBACK_HELP_LINES(siteUrl, channelUrl)
 
-  return helpLines.join('\n')
+  // We only list businesses now and payments are paused, so the shared help
+  // copy's personal-contact and EcoCash lines are hidden from the bot.
+  return helpLines
+    .filter(
+      line =>
+        !/personal contacts?/i.test(line) &&
+        !/\*Pay your subscription/i.test(line) &&
+        !/\*View payments/i.test(line) &&
+        !/MANAGE YOUR SUBSCRIPTION/i.test(line) &&
+        !/`pay`\s*-/i.test(line)
+    )
+    .join('\n')
+    .replace(/\n{3,}/g, '\n\n')
 }
 
 // Cancelling used to answer with the full help guide — for a number that owns
@@ -958,6 +970,14 @@ interface BotResult {
   km?: number
 }
 
+interface ItemRow {
+  business_id: string
+  name: string
+  price: number | null
+  id: string
+  image_url: string | null
+}
+
 // Cheapest matching item per business (the product tier). Priced items win
 // ordering; a business that only lists an unpriced match stays visible via
 // the "Price not listed" card instead of vanishing from results.
@@ -968,27 +988,53 @@ async function fetchMatchingItems(
   const out = new Map<string, { name: string; price: number | null; id?: string; image_url?: string | null }>()
   if (bizIds.length === 0 || term.length < 3) return out
   const tokens = term.split(/[^a-z0-9]+/).filter(w => w.length >= 2)
-  let req = getSupabase()
+  const variants = searchVariants(term)
+
+  // Name match (existing behaviour): word-tokens ANDed so the item tier keeps
+  // up with the tokenized order matcher; single tokens degrade to substring.
+  let nameReq = getSupabase()
     .from('business_items')
     .select('business_id, name, price, id, image_url')
     .in('business_id', bizIds)
     .eq('is_active', true)
-  // Word-tokens ANDed ("zzcart bread" → name must contain both) so the
-  // item tier keeps up with the tokenized order matcher; single tokens
-  // degrade to the old substring behavior.
-  if (tokens.length >= 2) tokens.forEach(t => { req = req.ilike('name', `%${t}%`) })
-  else {
-    const variants = searchVariants(term)
-    if (variants.length > 0) {
-      req = req.or([term, ...variants].map(v => `name.ilike.%${v}%`).join(','))
-    } else {
-      req = req.ilike('name', `%${term}%`)
-    }
+  if (tokens.length >= 2) tokens.forEach(t => { nameReq = nameReq.ilike('name', `%${t}%`) })
+  else if (variants.length > 0) {
+    nameReq = nameReq.or([term, ...variants].map(v => `name.ilike.%${v}%`).join(','))
+  } else {
+    nameReq = nameReq.ilike('name', `%${term}%`)
   }
-  const { data } = await req
-    .order('price', { ascending: true })
-    .limit(200)
-  for (const it of (data as { business_id: string; name: string; price: number | null; id: string; image_url: string | null }[]) || []) {
+
+  // Description match: sellers describe items in the caption ("black, 4
+  // plate"), so those words must find the product even when its name is
+  // generic. Projects without the description column simply return an error
+  // and we keep the name-only result.
+  let descReq = getSupabase()
+    .from('business_items')
+    .select('business_id, name, price, id, image_url')
+    .in('business_id', bizIds)
+    .eq('is_active', true)
+  if (tokens.length >= 2) tokens.forEach(t => { descReq = descReq.ilike('description', `%${t}%`) })
+  else if (variants.length > 0) {
+    descReq = descReq.or([term, ...variants].map(v => `description.ilike.%${v}%`).join(','))
+  } else {
+    descReq = descReq.ilike('description', `%${term}%`)
+  }
+
+  const [nameRes, descRes] = await Promise.all([
+    nameReq.order('price', { ascending: true }).limit(200),
+    descReq.limit(200),
+  ])
+  if (descRes.error) {
+    console.warn(`[items] description search unavailable: ${descRes.error.message}`)
+  }
+  const rows = [
+    ...((nameRes.data as ItemRow[] | null) || []),
+    ...(descRes.error ? [] : ((descRes.data as ItemRow[] | null) || [])),
+  ]
+  const seen = new Set<string>()
+  for (const it of rows) {
+    if (!it?.id || seen.has(String(it.id))) continue
+    seen.add(String(it.id))
     const cur = out.get(it.business_id)
     if (it.price != null) {
       if (!cur || cur.price == null || it.price < cur.price) {
@@ -1130,7 +1176,6 @@ const MENU_ROWS = [
   { id: 'menu_needs', title: '🛒 Post a need', description: 'Write what you need — suppliers find you' },
   { id: 'menu_order', title: '🧺 Order items', description: 'Type your shopping list — sent shop by shop' },
   { id: 'menu_register', title: '✎ Register business', description: 'List your business — quick questions, no plan choice' },
-  { id: 'menu_pay', title: '$ Pay (EcoCash)', description: 'Pay or top up your subscription via EcoCash' },
   { id: 'menu_bid', title: '🏆 Bid for #1', description: 'Own the top search spot for your category' },
   { id: 'menu_help', title: '✆ Help', description: 'Search tips, account help & support' },
 ]
@@ -1153,12 +1198,11 @@ function renderBuyerIntro(name?: string): string {
 async function sendMainMenu(from: string) {
   await clearSession(from)
   const ch = await channelLine()
-  await sendInteractiveList(
-    from,
-    [renderMainMenuBody(), ch].filter(Boolean).join('\n\n'),
-    MENU_ROWS,
-    'Main menu'
+  const menuBody = renderMainMenuBody().replace(
+    'Registering a business or personal contact? Tap ✎ Register below.',
+    'Register your business: tap ✎ Register below.'
   )
+  await sendInteractiveList(from, [menuBody, ch].filter(Boolean).join('\n\n'), MENU_ROWS, 'Main menu')
 }
 
 async function startRegister(from: string, initialText: string = '') {
@@ -2082,36 +2126,92 @@ async function handleItemSpecText(from: string, session: ChatSession, text: stri
 // as the item's description.
 
 const SHELF_BATCH_MAX = 5
+// Keep the upload window open this long after the last photo so photos sent
+// back-to-back land in one batch before the vision model runs.
+const SHELF_SETTLE_MS = 5_000
 
-function normaliseMoney(raw: string): number | null {
-  const s = raw.replace(/\s/g, '')
-  if (!s) return null
-  const cleaned = /^\d{1,3}(?:,\d{3})+(?:\.\d{1,2})?$/.test(s)
-    ? s.replace(/,/g, '')
-    : s.replace(',', '.')
-  const n = Number(cleaned)
-  return Number.isFinite(n) && n > 0 ? n : null
+function sleep(ms: number) {
+  return new Promise<void>(resolve => setTimeout(resolve, ms))
 }
 
-/** The seller's answer to an explicit price question. Numbers in any common
- * shape are prices; a normal sentence is a description; skip means no price. */
+function normaliseMoney(raw: string): number | null {
+  return parseMoney(raw.replace(/\s/g, ''))
+}
+
+/** Prices are always shown as a US dollar amount in WhatsApp inline-code so a
+ * buyer can never mistake a description number for the price. */
+function moneyLabel(value: number): string {
+  const rounded = Math.round(value * 100) / 100
+  return `US$${Number.isInteger(rounded) ? rounded : rounded.toFixed(2)}`
+}
+
+function priceCode(value: number): string {
+  return `\`${moneyLabel(value)}\``
+}
+
+// Words that only frame a price ("the price is 50", "selling for 50") and
+// should not leak into a description.
+const PRICE_FILLER =
+  /\b(?:the\s+)?(?:price|cost|charge|selling|sell|sale|is|for|at|only|just|about|around|its|it'?s|each|per|usd|us\$|dollars?|bucks?|please)\b/gi
+
+function cleanDescription(raw: string): string {
+  const text = raw
+    .replace(/\$\s*\d[\d.,]*|\d[\d.,]*\s*\$/g, ' ')
+    .replace(/\b(?:usd|us\$)\s*([\d.,]+)/gi, ' ')
+    .replace(/\b([\d.,]+)\s*(?:usd|dollars?|bucks?)\b/gi, ' ')
+    .replace(PRICE_FILLER, ' ')
+    .replace(/[\s,;:.-]{2,}/g, ' ')
+    .replace(/^[\s,;:.-]+|[\s,;:.-]+$/g, '')
+    .trim()
+    .slice(0, 300)
+  // "the price is 50" leaves only a filler word - it is not a description.
+  return /^(?:the|a|an|it|its|it'?s|price)$/i.test(text) ? '' : text
+}
+
+/** Parse a seller's answer to "what is the price of the stove?".
+ * A marked amount ($50, 50$, 50 usd, price 50) wins; otherwise any numeral is
+ * taken as the price (last one when several appear) and the remaining words
+ * become the description ("black 50" → 50, "black"). Pure text is a
+ * description and leaves the price unset. */
 function parsePriceReply(text: string):
-  | { kind: 'price'; value: number }
+  | { kind: 'price'; value: number; description?: string }
   | { kind: 'skip' }
   | { kind: 'description'; text: string } {
   const t = text.trim()
-  if (/^(?:skip|no|none|no price|n\/?a|free|not selling)$/i.test(t)) return { kind: 'skip' }
-  const m = t.match(/^(?:usd|us\$|\$)?\s*([\d.,]+)\s*(?:usd|dollars?|bucks?|\$)?$/i)
-  if (m) {
-    const value = normaliseMoney(m[1])
-    if (value != null) return { kind: 'price', value }
-  }
-  return { kind: 'description', text: t }
+  if (!t) return { kind: 'description', text: '' }
+  if (/^(?:skip|no|none|no price|n\/?a|free|not selling|can'?t say)$/i.test(t)) return { kind: 'skip' }
+
+  const money = String.raw`\d[\d.,]*`
+  const marked = t.match(
+    new RegExp(
+      String.raw`\$\s*(${money})|(${money})\s*\$|\b(?:usd|us\$)\s*(${money})|(${money})\s*(?:usd|dollars?|bucks?)\b|\bprice(?:\s*is|\s*:)?\s*\$?\s*(${money})`,
+      'i'
+    )
+  )
+  const markedValue = marked ? normaliseMoney(marked.slice(1).find(Boolean) || '') : null
+
+  // Any other numeral still answers an explicit price question. Prefer the
+  // last amount ("2 for 50" → 50, "black 4 plate 50" → 50).
+  const numbers = [...t.matchAll(/\d[\d.,]*/g)]
+  const candidate = markedValue ?? (numbers.length ? normaliseMoney(numbers[numbers.length - 1][0]) : null)
+  if (candidate == null) return { kind: 'description', text: t }
+
+  const last = numbers[numbers.length - 1]
+  const withoutPrice = marked
+    ? t.replace(marked[0], ' ')
+    : `${t.slice(0, last.index)} ${t.slice(last.index + last[0].length)}`
+  const description = cleanDescription(withoutPrice)
+  return { kind: 'price', value: candidate, description: description || undefined }
 }
 
-function batchSummaryLine(item: ShelfBatchItem): string {
-  const price = item.price != null ? `$${item.price}` : 'price not listed'
-  return `• *${item.name}* — ${price}`
+function batchSummaryLines(items: ShelfBatchItem[]): string[] {
+  const lines: string[] = []
+  for (const item of items) {
+    const price = item.price != null ? priceCode(item.price) : '_price not listed_'
+    lines.push(`• *${item.name}* — ${price}`)
+    if (item.description) lines.push(`> ${item.description}`)
+  }
+  return lines
 }
 
 /** Ask which live shop a batch belongs to when the seller owns several. */
@@ -2127,8 +2227,9 @@ async function askBatchShop(from: string, batch: ItemBatch, msgId?: string) {
   await sendInteractiveButtons(from, '🧺 Which shop are these items for?', rows, msgId)
 }
 
-/** Add one photo to the shelf batch (recognise it immediately, then keep the
- * seller going until 5 photos or an explicit Done). */
+/** Add one photo to the shelf batch. Recognition starts on arrival, but the
+ * bot stays quiet for 5 seconds after the last photo so a fast 2-5 photo run
+ * is analysed as one batch instead of interrupting after each image. */
 async function handleShelfBatchImage(
   from: string,
   session: ChatSession | null,
@@ -2137,28 +2238,30 @@ async function handleShelfBatchImage(
   mediaMsgId: string,
   bizList: ShelfBiz[]
 ) {
-  const existing = session?.data.itemBatch
-  if (existing?.asking != null) {
+  const initial = session?.data.itemBatch
+  if (initial?.phase === 'pricing' || initial?.asking != null) {
     await sendWhatsAppMessage(
       from,
-      `Finish setting prices first - how much is the *${existing.items[existing.asking]?.name || 'item'}*? Reply a price, or *skip*.`,
+      `Finish the prices first - what is the price of the *${initial.items[initial.asking ?? 0]?.name || 'item'}*? Reply a price, or *skip*.`,
       mediaMsgId
     )
     return
   }
-  if (!existing && bizList.length === 0) {
+  if (!initial && bizList.length === 0) {
     await sendWhatsAppMessage(from, 'I could not find a live shop for this number. Send *register* to list your business first.', mediaMsgId)
     return
   }
-  if ((existing?.imageCount || 0) >= SHELF_BATCH_MAX) {
+  if ((initial?.imageCount || 0) >= SHELF_BATCH_MAX) {
     await finalizeShelfBatch(
       from,
-      session || { phone: from, step: 'item_batch', data: { itemBatch: existing! } },
+      session || { phone: from, step: 'item_batch', data: { itemBatch: initial! } },
       mediaMsgId
     )
     return
   }
 
+  // Typing indicator stays on while the photo is saved, analysed and while
+  // the 5-second "more photos?" window is open.
   void markRead(mediaMsgId, true).catch(() => {})
   const media = await fetchWhatsAppMedia(mediaId)
   const imageUrl = media ? (await uploadLogoImage(new Uint8Array(media.buffer))) || '' : ''
@@ -2167,22 +2270,36 @@ async function handleShelfBatchImage(
     return
   }
 
+  // Vision runs now, while the seller's next photos are still arriving.
   const recognised = media ? await recognizeShelfItems(media.buffer, media.mime, caption) : null
-  const fallbackName = caption && !caption.includes('$')
-    ? caption.trim().slice(0, 60)
-    : `Item ${(existing?.items.length || 0) + 1}`
-  const found = recognised && recognised.length
-    ? recognised
-    : [{ name: fallbackName || 'Item', price: priceFromCaption(caption), description: caption && !caption.includes('$') ? caption.trim() : '' }]
 
-  const business = existing
-    ? { id: existing.businessId, name: existing.businessName }
-    : bizList.length === 1
-      ? { id: bizList[0].id, name: bizList[0].name }
-      : { id: '', name: '' }
+  // Another photo may have landed during analysis: re-read and merge so the
+  // batch is not lost to a stale session snapshot.
+  const latest = await getSession(from).catch(() => null)
+  const latestBatch = latest?.data.itemBatch
+  if (latestBatch?.phase === 'pricing' || latestBatch?.asking != null) {
+    await sendWhatsAppMessage(from, 'I am already pricing the last batch - finish those prices, then send this photo again.', mediaMsgId)
+    return
+  }
+  const base = latestBatch && (latestBatch.imageCount || 0) > (initial?.imageCount || 0) ? latestBatch : initial
+  if ((base?.imageCount || 0) >= SHELF_BATCH_MAX) {
+    await finalizeShelfBatch(
+      from,
+      latest || { phone: from, step: 'item_batch', data: { itemBatch: base! } },
+      mediaMsgId
+    )
+    return
+  }
 
+  const index = (base?.items.length || 0) + 1
+  const fallback: ShelfBatchItem = {
+    name: (stripPriceFromCaption(caption) || `Item ${index}`).slice(0, 60),
+    price: priceFromCaption(caption),
+    imageUrl,
+  }
+  const found = recognised && recognised.length ? recognised : [fallback]
   const items: ShelfBatchItem[] = [
-    ...(existing?.items || []),
+    ...(base?.items || []),
     ...found.map(f => ({
       name: f.name || 'Item',
       price: f.price ?? null,
@@ -2190,9 +2307,25 @@ async function handleShelfBatchImage(
       imageUrl,
     })),
   ]
-  const imageCount = (existing?.imageCount || 0) + 1
+  const imageCount = (base?.imageCount || 0) + 1
 
-  const batch: ItemBatch = { businessId: business.id, businessName: business.name, items, imageCount }
+  const business = base?.businessId
+    ? { id: base.businessId, name: base.businessName }
+    : bizList.length === 1
+      ? { id: bizList[0].id, name: bizList[0].name }
+      : { id: '', name: '' }
+
+  const token = `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`
+  const batch: ItemBatch = {
+    businessId: business.id,
+    businessName: business.name,
+    items,
+    imageCount,
+    phase: 'collecting',
+    lastPhotoAt: Date.now(),
+    batchToken: token,
+  }
+  await saveSession(from, 'item_batch', { itemBatch: batch })
 
   if (!batch.businessId) {
     await askBatchShop(from, batch, mediaMsgId)
@@ -2200,30 +2333,20 @@ async function handleShelfBatchImage(
   }
 
   if (imageCount >= SHELF_BATCH_MAX) {
-    await saveSession(from, 'item_batch', { itemBatch: batch })
     await finalizeShelfBatch(from, { phone: from, step: 'item_batch', data: { itemBatch: batch } }, mediaMsgId)
     return
   }
 
-  await saveSession(from, 'item_batch', { itemBatch: batch })
-  await sendInteractiveButtons(
-    from,
-    [
-      `📷 Saved photo ${imageCount}/${SHELF_BATCH_MAX}.`,
-      '',
-      ...items.map(batchSummaryLine),
-      '',
-      'Send another photo, or tap *Done* and I will ask for prices.',
-    ].join('\n'),
-    [
-      { id: 'itembatch_done', title: '✅ Done - set prices' },
-      { id: 'itembatch_cancel', title: '✖ Cancel' },
-    ],
-    mediaMsgId
-  )
+  // Wait out the quiet window. A newer photo replaces batchToken, so this
+  // request bows out and lets the newest one close the batch.
+  await sleep(SHELF_SETTLE_MS)
+  const after = await getSession(from).catch(() => null)
+  const now = after?.data.itemBatch
+  if (!now || now.batchToken !== token || now.phase !== 'collecting') return
+  await finalizeShelfBatch(from, after!, mediaMsgId)
 }
 
-/** Ask the next unpriced item, or insert everything once prices are settled. */
+/** Recognised items: list them once, then ask each unpriced item in turn. */
 async function finalizeShelfBatch(from: string, session: ChatSession, msgId?: string) {
   const batch = session.data.itemBatch
   if (!batch) {
@@ -2240,20 +2363,48 @@ async function finalizeShelfBatch(from: string, session: ChatSession, msgId?: st
     return
   }
 
+  const announce = batch.phase !== 'pricing'
+  const settled: ItemBatch = {
+    ...batch,
+    phase: 'pricing',
+    asking: undefined,
+    lastPhotoAt: undefined,
+    batchToken: undefined,
+  }
+
+  if (announce) {
+    const photos = batch.imageCount || batch.items.length
+    await sendWhatsAppMessage(
+      from,
+      [
+        `✅ *Got ${photos} photo${photos === 1 ? '' : 's'} - ${batch.items.length} item${batch.items.length === 1 ? '' : 's'} recognised.*`,
+        '',
+        ...batchSummaryLines(batch.items),
+        '',
+        'Now let us set the prices.',
+      ].join('\n'),
+      msgId
+    )
+  }
+
+  await askNextShelfPrice(from, settled, msgId)
+}
+
+/** Ask the next unpriced item, or save everything once prices are settled. */
+async function askNextShelfPrice(from: string, batch: ItemBatch, msgId?: string) {
   const idx = batch.items.findIndex(i => i.price == null && !i.priceSkipped)
   if (idx >= 0) {
-    const next: ItemBatch = { ...batch, asking: idx }
+    const next: ItemBatch = { ...batch, phase: 'pricing', asking: idx }
     await saveSession(from, 'item_batch', { itemBatch: next })
     const item = batch.items[idx]
     await sendInteractiveButtons(
       from,
       [
-        `🛒 *${batch.items.length} item${batch.items.length === 1 ? '' : 's'} recognised.*`,
+        `💰 *What is the price of the ${item.name}?*`,
+        ...(item.description ? ['', `> ${item.description}`] : []),
         '',
-        `How much is the *${item.name}*?`,
-        '',
-        'Reply a price like *50*, *$50* or *10 usd*, or *skip* if you do not want a price.',
-        '_No price? Send what it is (colour, size, condition) and I will keep that as the description._',
+        'Reply a number like *50*, *$50* or *10 usd*, or tap *Skip*.',
+        'Words you add are kept as the item description.',
       ].join('\n'),
       [
         { id: 'itembatch_skip', title: '⏭ Skip price' },
@@ -2264,55 +2415,83 @@ async function finalizeShelfBatch(from: string, session: ChatSession, msgId?: st
     return
   }
 
-  // Every price is settled - write the shelf rows and summarise.
-  const biz = batch.businessId
   let saved = 0
   for (const item of batch.items) {
     const ok = await insertShelfItem(
-      biz,
+      batch.businessId,
       { name: item.name, price: item.price, description: item.description },
       item.imageUrl
     )
     if (ok) saved += 1
   }
   await clearSession(from)
-  const lines = batch.items.map(batchSummaryLine)
-  const described = batch.items.filter(i => i.description)
   await sendWhatsAppMessage(
     from,
     [
       `✅ *${saved} item${saved === 1 ? '' : 's'} added to ${batch.businessName}.*`,
       '',
-      ...lines,
-      ...(described.length ? ['', '📝 *Details:*', ...described.map(i => `> *${i.name}:* ${i.description}`)] : []),
+      ...batchSummaryLines(batch.items),
       '',
-      'Customers can now see these in your shop. Send more photos anytime.',
+      'Customers can now see and search these in your shop. Send more photos anytime.',
     ].join('\n'),
     msgId
   )
+}
+
+function mergeDescription(old: string | undefined, add: string | undefined): string | undefined {
+  const extra = (add || '').trim()
+  if (!extra) return old
+  const base = (old || '').trim()
+  if (!base) return extra.slice(0, 300)
+  if (base.toLowerCase().includes(extra.toLowerCase())) return base
+  return `${base}, ${extra}`.slice(0, 300)
 }
 
 /** A typed answer while a batch price is being asked. */
 async function handleBatchPriceReply(from: string, session: ChatSession, text: string) {
   const batch = session.data.itemBatch
   if (!batch || batch.asking == null) return false
-  const item = batch.items[batch.asking]
+  const idx = batch.asking
+  const item = batch.items[idx]
   if (!item) return false
 
   const parsed = parsePriceReply(text)
-  if (parsed.kind === 'price') item.price = parsed.value
-  else if (parsed.kind === 'skip') item.priceSkipped = true
-  else {
-    item.description = [item.description, parsed.text].filter(Boolean).join(' — ').slice(0, 300)
-    item.priceSkipped = true
+  const items = batch.items.map((row, i) => (i === idx ? { ...row } : row))
+  const target = items[idx]
+
+  if (parsed.kind === 'price') {
+    target.price = parsed.value
+    target.priceSkipped = false
+    target.description = mergeDescription(target.description, parsed.description)
+    await sendWhatsAppMessage(
+      from,
+      [
+        `✅ *${target.name}* — ${priceCode(parsed.value)}`,
+        ...(target.description ? [`> ${target.description}`] : []),
+      ].join('\n')
+    )
+  } else if (parsed.kind === 'skip') {
+    target.priceSkipped = true
+    await sendWhatsAppMessage(from, `⏭ *${target.name}* - price skipped.`)
+  } else {
+    target.description = mergeDescription(target.description, parsed.text)
+    target.priceSkipped = true
+    await sendWhatsAppMessage(
+      from,
+      [
+        `📝 *${target.name}*`,
+        `> ${target.description || parsed.text}`,
+        '',
+        '_Saved as a description. Price not listed._',
+      ].join('\n')
+    )
   }
 
-  const next: ItemBatch = { ...batch, asking: undefined, items: [...batch.items] }
+  const next: ItemBatch = { ...batch, items, asking: undefined }
   await saveSession(from, 'item_batch', { itemBatch: next })
-  await finalizeShelfBatch(from, { phone: from, step: 'item_batch', data: { itemBatch: next } })
+  await askNextShelfPrice(from, next)
   return true
 }
-
 // A photo sent while the order verify screen is up is part of the order, not a
 // search. Store it on the pending order and repeat the send button.
 async function attachOrderPhoto(
@@ -2732,6 +2911,13 @@ function canonicalPlan(text: string): PlanType | null {
 // existing business or register a new one. If this WhatsApp number has
 // exactly one unpaid listing, confirm it directly (three-tap quick path).
 async function startPayChoice(from: string) {
+  // Payments are paused for now. The payment code stays for when they resume,
+  // but no path should ask a new or existing owner for EcoCash today.
+  await sendWhatsAppMessage(
+    from,
+    'Payments are paused for now. New listings are submitted free and go live when an admin approves them. Send *register* to list your business.'
+  )
+  return
   await clearSession(from)
   const own = await ownPayableListings(from)
   if (own.length === 1) {
@@ -2791,7 +2977,7 @@ async function ownPayableListings(from: string): Promise<{ id: string; name: str
 // Yellow-Pages-free businesses (conditions can change mid-conversation).
 
 // ── My subscriptions: /contact & /paid ───────────────────────────────
-// A payer's own listing subscriptions. /contact lists their personal contacts
+// A payer's own listing subscriptions. /contact lists their business listings
 // (registered by them, or listed on their number) and /paid lists everything
 // they pay for — both with expiry countdowns, so renewal is one *pay* away.
  // Matched by payer_phone (both stored formats) OR the listed number.
@@ -2878,16 +3064,15 @@ async function fetchMyListings(from: string): Promise<MyListingRow[]> {
 }
 
 function renderMyListings(rows: MyListingRow[], onlyPersonal: boolean): string {
-  const scope = onlyPersonal ? rows.filter(r => r.isPersonal) : rows
-  const title = onlyPersonal ? '📇 *Your personal contacts*' : '💳 *Your paid listings*'
+  // We only take business listings now; legacy personal rows stay in the
+  // database but are never surfaced in the bot.
+  const scope = onlyPersonal ? [] : rows.filter(r => !r.isPersonal)
   if (!scope.length) {
-    return onlyPersonal
-      ? 'No personal contacts yet.\n\nAdd one in seconds - send the name + phone, e.g.\n*Tendai Ncube 0771 234 567 Harare*'  // bot personal-contact intake
-      : 'Nothing paid for yet on your number.\n\n• Add a personal contact: send *register* and choose *Personal contact  $1/mo*\n• Check what is live: send *contact*'
+    return 'No business listings on this number yet.\n\nSend *register* to list your business - it goes live after admin approval.'
   }
   const statusIcon = (r: MyListingRow) =>
     r.status === 'active' ? '🟢' : r.status === 'pending' ? '🟡' : '🔴'
-  const lines = [`${title} - ${scope.length}`, '']
+  const lines = [`🏪 *Your business listings* - ${scope.length}`, '']
   scope.forEach((r, i) => {
     const bits = [
       statusIcon(r),
@@ -2897,15 +3082,11 @@ function renderMyListings(rows: MyListingRow[], onlyPersonal: boolean): string {
     ].filter(Boolean)
     lines.push(`${i + 1}. ${bits.join(' · ')}`)
   })
-  const expiringSoon = scope.filter(r => {
-    if (!r.expiresAt || r.status !== 'active') return false
-    return Math.ceil((new Date(r.expiresAt).getTime() - Date.now()) / 86400000) <= 3
-  })
   lines.push('')
   if (scope.some(r => r.status === 'pending')) {
-    lines.push('🟡 awaiting payment? Send *pay* and pick the listing to enter your EcoCash PIN.')
+    lines.push('🟡 Pending listings go live after admin approval. No payment is needed.')
   } else {
-    lines.push(expiringSoon.length ? `⏰ ${expiringSoon.length} winding down soon - renew with *pay*.` : 'Renew any: send *pay*.')
+    lines.push('Send *register* to add another business.')
   }
   return lines.join('\n')
 }
@@ -5195,18 +5376,9 @@ async function handleAction(from: string, session: ChatSession | null, action: s
       businessName: row?.name || 'your shop',
     }
     await saveSession(from, 'item_batch', { itemBatch: next })
-    if ((next.imageCount || 0) >= SHELF_BATCH_MAX) {
-      await finalizeShelfBatch(from, { phone: from, step: 'item_batch', data: { itemBatch: next } })
-      return
-    }
-    await sendInteractiveButtons(
-      from,
-      `📷 Saved ${next.imageCount || 0}/${SHELF_BATCH_MAX} photos for *${next.businessName}*.\n\nSend another photo, or tap *Done* and I will ask for prices.`,
-      [
-        { id: 'itembatch_done', title: '✅ Done - set prices' },
-        { id: 'itembatch_cancel', title: '✖ Cancel' },
-      ]
-    )
+    // The photos were already sent; picking the shop is the last step, so
+    // close the batch now instead of making the seller send more.
+    await finalizeShelfBatch(from, { phone: from, step: 'item_batch', data: { itemBatch: next } })
     return
   }
 
@@ -5616,7 +5788,10 @@ async function handleAction(from: string, session: ChatSession | null, action: s
       return
     case 'menu_pay':
     case 'pay':
-      await startPayChoice(from)
+      await sendWhatsAppMessage(
+        from,
+        'Payments are paused for now. New listings are submitted free and go live when an admin approves them. Send *register* to list your business.'
+      )
       return
     case 'pay_existing':
       await sendOwnPayList(from)
@@ -7643,50 +7818,36 @@ async function publishBusiness(from: string, session: ChatSession, msgId?: strin
   // that the form truly landed before the long status message arrives.
   if (msgId) await sendReaction(from, msgId, '✅').catch(() => {})
 
-  if (result.pendingPayment) {
-    // Paid row: no links or pitch yet — the go-live bundle arrives with the
-    // payment-confirmed activation message (lib/listing-activation.ts) once
-    // /api/paynow/result verifies the EcoCash payment.
-    await askEcoCashNumber(from, { id: result.businessId, name }, '1m')
-  } else {
-    await sendWhatsAppMessage(
-      from,
-      [
-        '🎉 *Submitted for Approval!*',
-        '',
-        `Your business "${name}" is now pending review.`,
-        'Once an admin approves it you will get a confirmation here.',
-        '',
-        '⭐ Public-service listing: our team verifies it fast.',
-        '',
-        '📸 *After go-live:* send a product photo with a caption that includes the product name and price (e.g. *bread $2*), and you can add extra details like *"i make home deliveries and customize cakes to your liking"*.',
-        'The bot will format it beautifully: it will quote your description, **bold the name**, and `inline-code` the price.',
-        '',
-        '📸 *Photo tips:* While optional, we strongly recommend uploading original photos of your actual products - this builds customer trust. Please avoid internet-sourced or AI-generated images. If we detect non-original images, they may be removed.',
-        '',
-        `✏️ Save this link to edit your listing later:`,
-        `${SITE_URL}/edit?token=${token}`,
-        '',
-        `🔐 Inside your portal (opens a web page): edit your listing & website, business card + QR code templates, stats, conversations.`,
-        `${SITE_URL}/account-setup?token=${token}`,
-        '',
-        `📱 Your QR codes (chat + portal): print them for customers:`,
-        `${SITE_URL}/my-qr/${slug}`,
-        '',
-        'Reply *help* anytime.',
-      ].join('\n')
-    )
-  }
-
-  // One-time channel pitch while the registration window is open: this is
-  // where live buyer needs surface, and quoting is one reply. Paid rows
-  // already get this with the activation message.
-  if (!result.pendingPayment) {
-    const chLink = await channelLinkRaw()
-    if (chLink) {
-      await sendWhatsAppMessage(from, renderChannelPitch(chLink)).catch(() => {})
-    }
-  }
+  // Payments are paused: every listing is submitted for approval and goes
+  // live when an admin approves it. Never ask for EcoCash at sign-up.
+  await sendWhatsAppMessage(
+    from,
+    [
+      '🎉 *Submitted for Approval!*',
+      '',
+      `Your business "${name}" is now pending review.`,
+      'No payment is needed. Once an admin approves it you will get a confirmation here.',
+      '',
+      ...(result.isYellowPages
+        ? ['⭐ Public-service listing: our team verifies it fast.', '']
+        : []),
+      '📸 *After go-live:* send product photos with a caption that includes the product name and price (e.g. *bread $2*), and add details like *"i make home deliveries and customize cakes to your liking"*.',
+      'The bot will list the items, quote descriptions, bold names, and show prices in US dollars.',
+      '',
+      '📸 *Photo tips:* While optional, we strongly recommend uploading original photos of your actual products - this builds customer trust. Please avoid internet-sourced or AI-generated images. If we detect non-original images, they may be removed.',
+      '',
+      `✏️ Save this link to edit your listing later:`,
+      `${SITE_URL}/edit?token=${token}`,
+      '',
+      `🔐 Inside your portal (opens a web page): edit your listing & website, business card + QR code templates, stats, conversations.`,
+      `${SITE_URL}/account-setup?token=${token}`,
+      '',
+      `📱 Your QR codes (chat + portal): print them for customers:`,
+      `${SITE_URL}/my-qr/${slug}`,
+      '',
+      'Reply *help* anytime.',
+    ].join('\n')
+  )
 
   // One-time channel pitch while the registration window is open: this is
   // where live buyer needs surface, and quoting is one reply.
@@ -7699,16 +7860,15 @@ async function publishBusiness(from: string, session: ChatSession, msgId?: strin
     sendAdminNotice(
       ADMIN_WHATSAPP,
       submissionNoticeBody({
-        title: result.pendingPayment
-          ? '🆕 NEW BUSINESS PENDING VERIFICATION'
-          : '🚨 YELLOW PAGES SUBMISSION: VERIFY FAST',
+        title: result.isYellowPages
+          ? '🚨 YELLOW PAGES SUBMISSION: VERIFY FAST'
+          : '🆕 NEW BUSINESS PENDING VERIFICATION',
         name,
         code: result.businessId,
         category: result.categories.join(', '),
         location: result.city || '',
         phone,
         extra: [
-          ...(result.pendingPayment ? [`Payment: pending (${SITE_URL}/admin)`] : []),
           ...(result.isYellowPages
             ? ['Public-service listing: verify ASAP for the Emergency & Essential strip.']
             : []),
@@ -8332,7 +8492,7 @@ export async function POST(request: Request) {
         }
 
         // ── My listings: /contact & /paid ────────────────────────────────
-        // /contact lists a payer's personal contacts, /paid everything their
+        // /contact lists a payer's business listings, /paid everything their
         // number has paid for — both with expiry countdowns. Slash forms are
         // unambiguous and fire even mid-flow; the bare words only fire when
         // no data-entry step could be expecting them as an answer.
@@ -8344,7 +8504,7 @@ export async function POST(request: Request) {
           lower === 'my contacts' ||
           ((lower === 'contact' || lower === 'contacts') && !dataEntryLocked)
         ) {
-          await sendMyListings(from, true)
+          await sendMyListings(from, false)
           await clearSession(from)
           continue
         }

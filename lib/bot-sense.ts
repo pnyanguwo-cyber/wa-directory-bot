@@ -80,14 +80,66 @@ export interface ShelfRecognition {
 }
 
 
-/** A caption only carries a price when a dollar sign is present. "50" alone
- * (or "50 usd" typed as a caption) is description, not price. */
-export function priceFromCaption(caption: string): number | null {
-  if (!caption || !caption.includes('$')) return null
-  const m = caption.match(/\$\s*(\d+(?:[.,]\d{1,2})?)|(\d+(?:[.,]\d{1,2})?)\s*\$/)
-  if (!m) return null
-  const value = Number((m[1] || m[2] || '').replace(',', '.'))
+/** Money with either separator style: "1,500" and "1.500" are 1500,
+ * "1,5" and "1.5" are 1.5, "1,500.50" is 1500.5. */
+export function parseMoney(raw: string): number | null {
+  let s = raw.trim().replace(/[.,]+$/, '')
+  if (!/^\d/.test(s)) return null
+  const hasComma = s.includes(',')
+  const hasDot = s.includes('.')
+  if (hasComma && hasDot) {
+    s = s.lastIndexOf(',') > s.lastIndexOf('.')
+      ? s.replace(/\./g, '').replace(',', '.')
+      : s.replace(/,/g, '')
+  } else if (hasComma) {
+    s = /^\d{1,3}(?:,\d{3})+$/.test(s) ? s.replace(/,/g, '') : s.replace(',', '.')
+  } else if (hasDot && /^\d{1,3}(?:\.\d{3})+$/.test(s)) {
+    s = s.replace(/\./g, '')
+  }
+  const value = Number(s)
   return Number.isFinite(value) && value > 0 ? value : null
+}
+
+// A caption carries a price only when it is explicitly marked: "$50", "50$",
+// "50 usd", "usd 50", or "price 50". A bare number ("black 50") stays text.
+const AMOUNT = String.raw`\d[\d.,]*`
+const CAPTION_PRICE_PATTERNS: RegExp[] = [
+  new RegExp(String.raw`\$\s*(${AMOUNT})`, 'i'),
+  new RegExp(String.raw`(${AMOUNT})\s*\$`),
+  new RegExp(String.raw`\b(?:usd|us\$)\s*(${AMOUNT})`, 'i'),
+  new RegExp(String.raw`(${AMOUNT})\s*(?:usd|dollars?|bucks?)\b`, 'i'),
+  new RegExp(String.raw`\bprice(?:\s*is|\s*:)?\s*\$?\s*(${AMOUNT})`, 'i'),
+]
+
+function captionPriceMatch(caption: string): RegExpExecArray | null {
+  if (!caption) return null
+  for (const pattern of CAPTION_PRICE_PATTERNS) {
+    const match = pattern.exec(caption)
+    if (match) return match
+  }
+  return null
+}
+
+/** The price written in a caption, or null when no explicit marker is used. */
+export function priceFromCaption(caption: string): number | null {
+  const m = captionPriceMatch(caption)
+  if (!m) return null
+  return parseMoney(m[1] || '')
+}
+
+/** Caption text with the explicit price bit removed, so it can be kept as a
+ * description ("black 4 plate stove $50" → "black 4 plate stove"). */
+export function stripPriceFromCaption(caption: string): string {
+  const m = captionPriceMatch(caption)
+  if (!m) return caption.trim()
+  return `${caption.slice(0, m.index)} ${caption.slice(m.index + m[0].length)}`
+    // A $ match can leave "price" or "US" behind when the caption said
+    // "price: $50" or "US$50".
+    .replace(/\b(?:price|usd|us|dollars?|bucks?)\b\s*[:=-]?/gi, ' ')
+    .replace(/\s*[,;]+\s*$/g, '')
+    .replace(/\s{2,}/g, ' ')
+    .replace(/^[\s,;:.-]+|[\s,;:.-]+$/g, '')
+    .trim()
 }
 
 /** Identify the product(s) in one photo for a seller's shop shelf. One photo
@@ -105,12 +157,15 @@ export async function recognizeShelfItems(
   const captionLine = caption ? `\nThe seller's caption: "${caption}".` : ''
   const instruction =
     `This is a product photo a Zimbabwe shop owner is adding to their online shelf.${captionLine}\n\n` +
-    `Identify every distinct product the seller is offering in the photo, in plain English (1-4 words each), e.g. "wooden bed", "office chair", "gas stove". ` +
+    `Identify every distinct product the seller is offering in the photo. ` +
+    `The name is the product noun only, 1-4 plain English words, with no colour, size or condition (e.g. "stove", "office chair", "wooden bed"). ` +
     `If the photo shows one product, return one item. If it clearly shows several products, return each one.\n` +
-    `PRICE RULE: a price is allowed ONLY when a dollar sign ($) appears in the caption or is clearly written on the item. ` +
-    `If no $ appears anywhere, price MUST be null and all caption words are a description, not a price.\n` +
-    `The description is the seller's own words about the item (colour, size, condition, delivery, etc.), or a short plain description of what is visible.\n` +
-    `Reply ONLY with a JSON object: {"items":[{"name":"<product name>","price":<number or null>,"description":"<short description or empty>"}]}. No markdown.`
+    `The description is the visible detail buyers would search for: colour, material, size, plates, condition, etc. ` +
+    `Write it as short comma-separated attributes, e.g. a black four-plate stove is name "stove" with description "black, 4 plate". ` +
+    `Add the seller's own caption details (delivery, customisation, condition) when present, but never repeat the price there.\n` +
+    `PRICE RULE: a price is allowed ONLY when the caption has an explicit $, usd, or "price" marker, or a price is clearly written on the item. ` +
+    `A bare number in the caption is part of the description, not a price.\n` +
+    `Reply ONLY with a JSON object: {"items":[{"name":"<product name>","price":<number or null>,"description":"<short comma-separated description or empty>"}]}. No markdown.`
 
   const parts: GeminiPart[] = [
     { text: instruction },
@@ -133,14 +188,20 @@ export async function recognizeShelfItems(
         typeof row[k] === 'string' ? (row[k] as string).trim().slice(0, 300) : ''
       const rawPrice = Number(row.price)
       let price = Number.isFinite(rawPrice) && rawPrice > 0 ? rawPrice : null
-      // Enforce the seller rule in code too: caption text without a $ cannot be
-      // a price, even if the model guessed one.
-      if (caption && caption.trim() && !caption.includes('$')) price = null
-      if (price == null && captionPrice != null) price = captionPrice
+      // Enforce the seller rule in code too: a caption without an explicit
+      // price marker cannot be a price, even if the model guessed one.
+      if (caption && caption.trim() && captionPrice == null) price = null
+      if (captionPrice != null) price = captionPrice
       out.push({
         name: (str('name') || 'Item').slice(0, 80),
         price,
-        description: str('description'),
+        // The model sometimes echoes the price into the description; a
+        // description must never look like a second price.
+        description: str('description')
+          .replace(/\$\s*\d[\d.,]*/g, '')
+          .replace(/\b\d[\d.,]*\s*(?:usd|dollars?|bucks?)\b/gi, '')
+          .replace(/\s*,\s*$/, '')
+          .trim(),
       })
     }
     return out.length ? out : null

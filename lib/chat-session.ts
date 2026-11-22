@@ -148,16 +148,23 @@ export interface ShelfBatchItem {
   priceSkipped?: boolean
 }
 
-// Seller shelf-upload batch: images are recognised as they arrive; prices are
-// then asked one item at a time (a text reply becomes the description).
+// Seller shelf-upload batch: photos are recognised as they arrive but the
+// bot stays quiet for 5 seconds after the last one, then lists the items and
+// asks their prices one at a time.
 export interface ItemBatch {
   businessId: string
   businessName: string
   items: ShelfBatchItem[]
   // Photos received in this batch (one photo may yield several items).
   imageCount?: number
-  // Index of the item whose price is currently being asked. Undefined while
-  // the seller is still sending photos.
+  // 'collecting' = waiting for more photos / the settle timer;
+  // 'pricing' = the settle window closed and prices are being asked.
+  phase?: 'collecting' | 'pricing'
+  // Identifies the newest upload; an older timer request backs off when a
+  // newer photo has arrived.
+  lastPhotoAt?: number
+  batchToken?: string
+  // Index of the item whose price is currently being asked.
   asking?: number
 }
 
