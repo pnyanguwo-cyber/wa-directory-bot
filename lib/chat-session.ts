@@ -39,6 +39,14 @@ export interface ChatSessionData {
   // Step 'admin_add_business': an admin is keying in the number that will own
   // a listing added for someone else.
   addingBusiness?: boolean
+  // Interactive category tree (admin): guided connect inputs and the
+  // connection picked from the ✂️ disconnect list. `treeLink` is resolved from
+  // `treeLinks` the moment a row is tapped, so an expired list cannot act on
+  // the wrong branch.
+  treeConnectChild?: string
+  treeConnectParent?: string
+  treeLinks?: Array<{ raw: string; child: string; parent: string }>
+  treeLink?: { raw: string; child: string; parent: string }
   rating_pending?: string
   // ── Bot search flow ────────────────────────────────────────────────
   // Term typed by the user while waiting for a town ("Which town?").

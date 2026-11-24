@@ -130,6 +130,7 @@ import type { PlanType } from '@wa-directory/shared'
 import { SITE_URL } from '@wa-directory/shared'
 import { digitsOnly } from '@wa-directory/shared'
 import { searchVariants, matchesSearchTerm } from '@wa-directory/shared'
+import { connectedCategoryNames, listingHasCategory, clearCategoryLinkCache, linkCategories, categoryTree, listCategoryConnections, unlinkCategory, type CategoryTreeNode } from '../lib/category-links.js'
 import { listEmergencyContacts, addEmergencyContact, deleteEmergencyContact, clearEmergencyContacts, findEmergencyNear, parseEmergencyAdd, emergencyWaLink, categoryIcon, VALID_CATEGORIES } from '../lib/emergency.js'
 import {
   CHAT_OPEN_MARKER,
@@ -953,9 +954,12 @@ async function sendGoalAskButtons(from: string, kind: GoalAskKind, word: string,
 function bizMatchesQuery(
   b: BotBusinessRow,
   lowerTerm: string,
-  category: string
+  categories: string | string[]
 ): boolean {
-  const catHit = category !== 'Other' && (b.category || []).includes(category)
+  const names = Array.isArray(categories) ? categories : [categories]
+  // Connected categories answer to every name they are filed under, so
+  // "tree cutting" and "landscaping" find the same shops.
+  const catHit = listingHasCategory(b.category, names)
   // British/American variants: "fertilizer" must still find "Fertiliser".
   const nameHit = lowerTerm.length >= 3 && matchesSearchTerm(b.name, lowerTerm)
   return catHit || nameHit
@@ -1120,8 +1124,9 @@ async function findRelatedBusinesses(
   const matchedTerms: string[] = []
   for (const t of terms) {
     const cat = matchCategoryAgainst(t, approved)
+    const names = await connectedCategoryNames(t, cat)
     const hit = scope
-      .filter(b => !seen.has(b.id) && bizMatchesQuery(b, t, cat))
+      .filter(b => !seen.has(b.id) && bizMatchesQuery(b, t, names))
       .sort((a, b) => (b.rating || 0) - (a.rating || 0))[0]
     if (hit) {
       seen.add(hit.id)
@@ -1665,16 +1670,79 @@ async function resumePaused(from: string, session: ChatSession | null): Promise<
   }
 }
 
+// Zimbabwe phone entry from an admin: 0771234567 and +263771234567 both
+// normalize to 263771234567, which is the number the listing - and therefore
+// the portal account - will belong to.
+function normalizeRegistrationOwner(raw: string): string {
+  const digits = digitsOnly(raw)
+  if (!digits) return ''
+  if (digits.startsWith('00')) return digits.slice(2)
+  if (digits.startsWith('0')) return `263${digits.slice(1)}`
+  return digits
+}
+
+function registrationOwnerContext(context: any): { onBehalfOf?: string; regForSelf?: boolean } {
+  const owner = typeof context?.onBehalfOf === 'string' ? normalizeRegistrationOwner(context.onBehalfOf) : ''
+  return {
+    ...(owner ? { onBehalfOf: owner } : {}),
+    ...(context?.regForSelf === true ? { regForSelf: true } : {}),
+  }
+}
+
+// Admins can list a business they do not own. The same registration flow runs
+// on their chat, but the listing phone (and so the portal account) is the
+// owner's number and the success message comes to the admin to forward.
+async function showAdminRegistrationChoice(from: string) {
+  await sendInteractiveButtons(
+    from,
+    [
+      '🏪 *Register a business*',
+      '',
+      'Is this your own business, or are you adding one for someone else?',
+      '',
+      'Adding another business keeps their number as the owner - the portal, website and every cart/order reply go to them, and the success message comes to you to forward.',
+    ].join('\n'),
+    [
+      { id: 'reg_for_self', title: '🏪 My business' },
+      { id: 'reg_for_other', title: '🏬 Another business' },
+    ]
+  )
+}
+
 // ✎ Register goes straight to the image-first step: send a business card or
 // enter the details manually. The plan/trial choice and the personal-contact
 // option are deliberately skipped.
-async function startImageFirstRegister(from: string) {
+async function startImageFirstRegister(
+  from: string,
+  opts: { onBehalfOf?: string; asSelf?: boolean } = {}
+) {
+  const existing = await getConversationState(from)
+  const prior = existing?.state?.startsWith('REGISTRATION_') ? existing.context : undefined
+  const owner = opts.asSelf
+    ? ''
+    : normalizeRegistrationOwner(opts.onBehalfOf || '') ||
+      (typeof prior?.onBehalfOf === 'string' ? normalizeRegistrationOwner(prior.onBehalfOf) : '')
+  const asSelf = opts.asSelf === true || (!owner && prior?.regForSelf === true)
+
+  // An admin starting a registration chooses whose business it is first.
+  if (!owner && !asSelf && (await isBotAdmin(from))) {
+    await showAdminRegistrationChoice(from)
+    return
+  }
+
   await clearSession(from)
   await clearConversationState(from)
   const saved = await setConversationState(from, 'REGISTRATION_AWAITING_IMAGE', {
     step: 'choose_material',
     approvedPlan: 'trial',
     trialRequested: true,
+    ...(owner
+      ? {
+          onBehalfOf: owner,
+          fields: { phone: { value: owner, confidence: 1, status: 'suggested' } },
+        }
+      : {}),
+    ...(asSelf ? { regForSelf: true } : {}),
   })
   if (!saved) {
     await sendWhatsAppMessage(
@@ -1685,10 +1753,14 @@ async function startImageFirstRegister(from: string) {
   }
   await sendInteractiveButtons(
     from,
-    "🏪 *Let's get your business listed!*\n\n" +
-      'Have a business card, flyer, banner or advert? Send us a picture and our AI ' +
-      'will extract the business information it can identify, saving you time.\n\n' +
-      'You can also skip this step and enter your details manually.',
+    owner
+      ? `🏬 *Adding a business for +${owner}*\n\n` +
+          'Send its business card, flyer, banner or advert and our AI will read the details, or enter them manually.\n\n' +
+          `The listing and portal will belong to +${owner} - not to you. You will get the success message, portal link and website to forward to them.`
+      : "🏪 *Let's get your business listed!*\n\n" +
+          'Have a business card, flyer, banner or advert? Send us a picture and our AI ' +
+          'will extract the business information it can identify, saving you time.\n\n' +
+          'You can also skip this step and enter your details manually.',
     [
       { id: 'reg_upload', title: '📷 Send a picture' },
       { id: 'reg_skip', title: 'Skip and enter manually' },
@@ -1775,8 +1847,23 @@ async function fieldsFromFastCard(fast: FastCardFields) {
 async function applyRegistrationExtraction(
   from: string,
   fields: Record<string, any>,
-  opts: { approvedPlan?: 'trial' | PlanType; trialRequested: boolean; draft?: any; source: string }
+  opts: {
+    approvedPlan?: 'trial' | PlanType
+    trialRequested: boolean
+    draft?: any
+    source: string
+    onBehalfOf?: string
+    regForSelf?: boolean
+  }
 ) {
+  // The owner's number wins over whatever the card says: it is the number the
+  // listing (and its portal account) belongs to.
+  if (opts.onBehalfOf) {
+    fields = {
+      ...fields,
+      phone: registrationExtractedField(opts.onBehalfOf, 1),
+    }
+  }
   const missing = REGISTRATION_REQUIRED.filter((key) => !fields?.[key]?.value)
   const draft = opts.draft || {
     fields,
@@ -1794,6 +1881,8 @@ async function applyRegistrationExtraction(
     fields,
     missing,
     currentMissingIndex: 0,
+    ...(opts.onBehalfOf ? { onBehalfOf: opts.onBehalfOf } : {}),
+    ...(opts.regForSelf ? { regForSelf: true } : {}),
   }
 
   if (missing.length) {
@@ -1839,11 +1928,13 @@ async function handleRegistrationImageResilient(from: string, bytes: Uint8Array,
   const approvedPlan = previous?.context?.approvedPlan as 'trial' | PlanType | undefined
   const trialRequested =
     previous?.context?.trialRequested === true || approvedPlan === 'trial'
+  const ownerContext = registrationOwnerContext(previous?.context)
 
   await setConversationState(from, 'REGISTRATION_PROCESSING_IMAGE', {
     step: 'processing',
     approvedPlan,
     trialRequested,
+    ...ownerContext,
   })
   logOnboarding('registration_image_received', { phone: maskPhone(from) })
   await sendWhatsAppMessage(from, '🔍 Reading your business material with AI... Please give us a moment.')
@@ -1862,6 +1953,7 @@ async function handleRegistrationImageResilient(from: string, bytes: Uint8Array,
       approvedPlan,
       trialRequested,
       source: 'fast_card',
+      ...ownerContext,
     })
     return
   }
@@ -1880,6 +1972,7 @@ async function handleRegistrationImageResilient(from: string, bytes: Uint8Array,
           trialRequested,
           draft: outcome.draft,
           source: 'structured',
+          ...ownerContext,
         })
         return
       }
@@ -1892,6 +1985,7 @@ async function handleRegistrationImageResilient(from: string, bytes: Uint8Array,
     step: 'choose_material',
     approvedPlan,
     trialRequested,
+    ...ownerContext,
   })
   logOnboarding('registration_image_failed', {
     phone: maskPhone(from),
@@ -1937,12 +2031,19 @@ function registrationField(fields: Record<string, { value?: string } | undefined
   return (fields?.[key]?.value || '').toString().trim()
 }
 
-function buildRegistrationListing(fields: Record<string, { value?: string } | undefined> | undefined) {
+function buildRegistrationListing(
+  fields: Record<string, { value?: string } | undefined> | undefined,
+  ownerPhone?: string
+) {
+  // An on-behalf registration seeds the owner's number into `phone`, so an
+  // admin edit still wins; the stored owner number is only a fallback.
+  const cardPhone = registrationField(fields, 'phone')
+  const phone = cardPhone || normalizeRegistrationOwner(ownerPhone || '')
   return {
     name: registrationField(fields, 'business_name'),
     categories: [registrationField(fields, 'category') || 'Other'],
     city: registrationField(fields, 'city'),
-    phone: registrationField(fields, 'phone'),
+    phone,
     area: registrationField(fields, 'area'),
     description: registrationField(fields, 'description'),
     website: registrationField(fields, 'website'),
@@ -1958,7 +2059,7 @@ async function applyRegistrationReviewEdit(from: string, context: any, edit: Reg
   const fields = { ...(context.fields || {}) }
   fields[edit.key] = { value: edit.value, confidence: 1, status: 'suggested' }
   if (edit.key === 'category') fields.requested_category = fields[edit.key]
-  const listing = buildRegistrationListing(fields)
+  const listing = buildRegistrationListing(fields, context.onBehalfOf)
   await updateConversationContext(from, { fields, listing })
   return { fields, listing }
 }
@@ -2024,14 +2125,58 @@ async function publishRegistrationReview(from: string, state: any) {
   const context = state?.context || {}
   if (context.step !== 'review_extracted') return
   const fields = context.fields || {}
-  const listing = buildRegistrationListing(fields)
+  const listing = buildRegistrationListing(fields, context.onBehalfOf)
   const finalContext = { ...context, step: 'final_review', fields, listing }
   const saved = await setConversationState(from, 'REGISTRATION_FINAL_REVIEW', finalContext)
   if (!saved) {
     await sendWhatsAppMessage(from, '⚠️ Something went wrong saving your listing. Send *register* to start again.')
     return
   }
-  await handleRegistrationMessage(from, 'publish', finalContext)
+  await runRegistrationAction(from, 'publish', finalContext)
+}
+
+// After an on-behalf registration is published the admin gets one compact,
+// forwardable card: who owns it, the portal and the listing/website link. The
+// shared flow's own success message already went to this chat, so this is the
+// hand-over summary for the new business.
+async function sendAdminRegistrationSummary(from: string, ownerPhone: string) {
+  const state = await getConversationState(from)
+  const context = state?.context || {}
+  if (state?.state !== 'AWAITING_ADMIN_REVIEW' || !context.businessId) return
+
+  const { data: biz } = await getSupabase()
+    .from('businesses')
+    .select('name, slug, business_id, username, website')
+    .eq('id', context.businessId)
+    .maybeSingle()
+  if (!biz) return
+
+  const profile = biz.slug ? `${SITE_URL}/business/${biz.slug}` : ''
+  const lines = [
+    '📤 *Registered - forward this to the business*',
+    '',
+    `Business: *${biz.name}*`,
+    `Owner WhatsApp: +${ownerPhone}`,
+    `Business ID: ${biz.business_id}`,
+    ...(biz.username ? [`Username: @${biz.username}`] : []),
+    ...(biz.website ? [`Website: ${biz.website}`] : []),
+    ...(profile ? [`Listing${biz.website ? '' : ' / free website'}: ${profile}`] : []),
+    `Portal: ${SITE_URL}/login`,
+    '',
+    `Their portal account is under +${ownerPhone}. Forward this card and the success message above to them.`,
+  ]
+  await sendWhatsAppMessage(from, lines.join('\n'))
+}
+
+/** Registration turn wrapper: keeps the on-behalf owner attached and sends
+ * the admin hand-over card once publishing succeeded. */
+async function runRegistrationAction(from: string, action: string, context: any) {
+  const owner =
+    typeof context?.onBehalfOf === 'string' ? normalizeRegistrationOwner(context.onBehalfOf) : ''
+  await handleRegistrationMessage(from, action, context)
+  if (owner && /^(?:publish|reg_publish)$/i.test(action.trim())) {
+    await sendAdminRegistrationSummary(from, owner)
+  }
 }
 
 async function handleRegistrationReviewText(from: string, text: string, state: any): Promise<boolean> {
@@ -3118,6 +3263,7 @@ async function handleBotMedia(
         step: 'choose_material',
         approvedPlan: 'trial',
         trialRequested: true,
+        ...registrationOwnerContext(convState.context),
       })
     }
     const media = await fetchWhatsAppMedia(mediaId)
@@ -4468,6 +4614,126 @@ function parseAdminRewrite(text: string): {
   return { fields, bare, used: true }
 }
 
+/** Resolve an admin-typed category against the approved list. */
+function pickApprovedCategory(
+  approved: Array<{ name: string }>,
+  input: string
+): { name?: string; error?: string } {
+  const wanted = (input || '')
+    .trim()
+    .replace(/^["']|["']$/g, '')
+    .replace(/[.;]$/, '')
+    .trim()
+  if (!wanted) return { error: 'Send a category name.' }
+  const exact = approved.find(c => c.name.toLowerCase() === wanted.toLowerCase())
+  if (exact) return { name: exact.name }
+  const close = approved
+    .filter(c => c.name.toLowerCase().includes(wanted.toLowerCase()) || wanted.toLowerCase().includes(c.name.toLowerCase()))
+    .map(c => c.name)
+    .slice(0, 5)
+  return {
+    error:
+      `*${wanted}* is not an approved category.` +
+      (close.length ? `\nClosest: ${close.join(', ')}` : '') +
+      '\nApprove it first with *approve req <n>*, then connect it.',
+  }
+}
+
+function renderCategoryTree(trees: CategoryTreeNode[], connections: number): string {
+  const lines = [`🌳 *Category tree* - ${connections} connection${connections === 1 ? '' : 's'}`, '']
+  const countNodes = (nodes: CategoryTreeNode[]): number =>
+    nodes.reduce((total, node) => total + 1 + countNodes(node.children), 0)
+  const total = countNodes(trees)
+  const cap = 60
+  let shown = 0
+
+  const walk = (nodes: CategoryTreeNode[], depth: number) => {
+    for (const node of nodes) {
+      if (shown >= cap) return
+      shown++
+      lines.push(depth === 0 ? `*${node.name}*` : `${'  '.repeat(depth)}└ ${node.name}`)
+      walk(node.children, depth + 1)
+    }
+  }
+  walk(trees, 0)
+  if (total > shown) lines.push(`… and ${total - shown} more`)
+  return lines.join('\n')
+}
+
+// The tree message carries the actions, so an admin can connect or disconnect
+// a branch without typing the command syntax.
+async function showAdminCategoryTree(from: string) {
+  const tree = await categoryTree()
+  const current = await getSession(from)
+  await saveSession(from, 'admin_tree', {
+    ...(current?.data || {}),
+    treeConnectChild: undefined,
+    treeConnectParent: undefined,
+    treeLinks: undefined,
+    treeLink: undefined,
+  })
+
+  if (!tree.connections) {
+    await sendInteractiveButtons(
+      from,
+      '🌳 *Category tree*\n\nNo category connections yet. Connect a child category to a parent and buyers searching either name will see both.',
+      [{ id: 'tree_connect', title: '🔗 Connect branch' }]
+    )
+    return
+  }
+
+  const body = `${renderCategoryTree(tree.trees, tree.connections)}\n\nConnect or disconnect a branch:`
+  const buttons: InteractiveButton[] = [
+    { id: 'tree_connect', title: '🔗 Connect' },
+    { id: 'tree_disconnect', title: '✂️ Disconnect' },
+    { id: 'tree_done', title: '✖ Close' },
+  ]
+  if (body.length <= 1000) {
+    await sendInteractiveButtons(from, body, buttons)
+  } else {
+    await sendWhatsAppMessage(from, body)
+    await sendInteractiveButtons(from, 'Connect or disconnect a branch:', buttons)
+  }
+}
+
+async function finishTreeConnect(from: string, session: ChatSession | null): Promise<void> {
+  const child = session?.data.treeConnectChild
+  const parent = session?.data.treeConnectParent
+  if (!child || !parent) {
+    await clearSession(from)
+    await sendWhatsAppMessage(from, '⌛ That connection expired. Send *category tree* to start again.')
+    return
+  }
+  const linked = await linkCategories(child, parent)
+  if (!linked.ok) {
+    await sendWhatsAppMessage(from, `⚠️ ${linked.error || 'Could not connect those categories.'}`)
+    return
+  }
+  await clearSession(from)
+  await sendWhatsAppMessage(from, `🔗 *${child}* is now an element of *${parent}*.`)
+  await showAdminCategoryTree(from)
+}
+
+async function finishTreeDisconnect(from: string, session: ChatSession | null): Promise<void> {
+  const link = session?.data.treeLink
+  if (!link) {
+    await clearSession(from)
+    await sendWhatsAppMessage(from, '⌛ That connection expired. Send *category tree* to start again.')
+    return
+  }
+  const removed = await unlinkCategory(link.raw)
+  if (!removed.ok) {
+    await sendWhatsAppMessage(from, `⚠️ ${removed.error || 'Could not remove that connection.'}`)
+    return
+  }
+  await clearSession(from)
+  await sendWhatsAppMessage(
+    from,
+    `✂️ *${link.child}* is no longer under *${link.parent}*. Searching either name keeps its own results.`
+  )
+  await showAdminCategoryTree(from)
+}
+
 function rewriteSummary(changed: string[]): string {
   return changed.length ? changed.join(' · ') : 'nothing changed'
 }
@@ -4596,9 +4862,10 @@ async function handleAdminCommand(from: string, text: string): Promise<boolean> 
 
   // ── Add a business on someone else's behalf ──────────────────────────
   // Admins (and owners) can list a business they do not own. The system asks
-  // for the number that will own it, then invites that number into the same
-  // registration flow — so control of the listing, its portal and every
-  // cart/order reply sits with the owner, never with the admin who keyed it in.
+  // for the number that will own it, then runs the SAME registration flow on
+  // the admin's chat with that number on the listing — so control of the
+  // listing, its portal and every cart/order reply sits with the owner, while
+  // the success message comes back to the admin to forward.
   const adminSession = await getSession(from)
   if (adminSession?.step === 'admin_add_business') {
     if (lower === 'cancel') {
@@ -4606,8 +4873,7 @@ async function handleAdminCommand(from: string, text: string): Promise<boolean> 
       await sendWhatsAppMessage(from, '✖ Cancelled. Nothing was added.')
       return true
     }
-    const rawOwner = digitsOnly(clean)
-    const owner = rawOwner.startsWith('0') ? `263${rawOwner.slice(1)}` : rawOwner
+    const owner = normalizeRegistrationOwner(clean)
     if (owner.length < 10 || owner.length > 15) {
       await sendWhatsAppMessage(
         from,
@@ -4616,14 +4882,115 @@ async function handleAdminCommand(from: string, text: string): Promise<boolean> 
       return true
     }
     await resetForNewSearch(from, adminSession)
-    await startImageFirstRegister(owner)
+    await startImageFirstRegister(from, { onBehalfOf: owner })
+    return true
+  }
+
+  // Guided connect from the interactive category tree. Only typed answers are
+  // handled here: a button tap arrives as an empty message and must fall
+  // through to handleAction, or the tap would be swallowed by a re-prompt.
+  if (clean && adminSession?.step === 'admin_tree_connect_child') {
+    if (lower === 'cancel') {
+      await clearSession(from)
+      await sendWhatsAppMessage(from, '✖ Cancelled. Nothing was connected.')
+      return true
+    }
+    const child = pickApprovedCategory(await getApprovedCategories(), clean)
+    if (!child.name) {
+      await sendWhatsAppMessage(from, `⚠️ ${child.error}\n\nType *cancel* to stop.`)
+      return true
+    }
+    await saveSession(from, 'admin_tree_connect_parent', {
+      ...(adminSession.data || {}),
+      treeConnectChild: child.name,
+    })
     await sendWhatsAppMessage(
       from,
+      `Child: *${child.name}*.\n\nNow send the *parent* category it should sit under (e.g. Landscaping).\n\nType *cancel* to stop.`
+    )
+    return true
+  }
+
+  if (clean && adminSession?.step === 'admin_tree_connect_parent') {
+    if (lower === 'cancel') {
+      await clearSession(from)
+      await sendWhatsAppMessage(from, '✖ Cancelled. Nothing was connected.')
+      return true
+    }
+    const parent = pickApprovedCategory(await getApprovedCategories(), clean)
+    if (!parent.name) {
+      await sendWhatsAppMessage(from, `⚠️ ${parent.error}\n\nType *cancel* to stop.`)
+      return true
+    }
+    const child = adminSession.data?.treeConnectChild
+    if (!child) {
+      await saveSession(from, 'admin_tree_connect_child', { ...(adminSession.data || {}) })
+      await sendWhatsAppMessage(
+        from,
+        'Which *child* category should sit under another? Send its name (e.g. Tree Cutting).'
+      )
+      return true
+    }
+    if (child.toLowerCase() === parent.name.toLowerCase()) {
+      await sendWhatsAppMessage(from, '⚠️ A category cannot be connected to itself. Send a different parent category.')
+      return true
+    }
+    await saveSession(from, 'admin_tree_connect_confirm', {
+      ...(adminSession.data || {}),
+      treeConnectParent: parent.name,
+    })
+    await sendInteractiveButtons(
+      from,
+      `Connect *${child}* under *${parent.name}*?\n\nBuyers searching either name will see both.`,
       [
-        `✅ Invite sent to +${owner}.`,
-        '',
-        'They will be walked through the same registration steps. When they publish, the listing belongs to their number — cart and order replies go to them, not to you.',
-      ].join('\n')
+        { id: 'tree_connect_yes', title: '🔗 Connect' },
+        { id: 'tree_connect_no', title: '✖ Cancel' },
+      ]
+    )
+    return true
+  }
+
+  if (clean && adminSession?.step === 'admin_tree_connect_confirm') {
+    if (/^(?:yes|y|connect|ok|confirm)$/i.test(lower)) {
+      await finishTreeConnect(from, adminSession)
+      return true
+    }
+    if (lower === 'cancel' || lower === 'no') {
+      await clearSession(from)
+      await sendWhatsAppMessage(from, '✖ Cancelled. Nothing was connected.')
+      return true
+    }
+    await sendWhatsAppMessage(
+      from,
+      `Tap *🔗 Connect* to file *${adminSession.data?.treeConnectChild || 'it'}* under *${adminSession.data?.treeConnectParent || 'that category'}*, or *✖ Cancel* to stop.`
+    )
+    return true
+  }
+
+  if (clean && adminSession?.step === 'admin_tree_disconnect') {
+    if (lower === 'cancel') {
+      await clearSession(from)
+      await sendWhatsAppMessage(from, '✖ Cancelled. Nothing was disconnected.')
+      return true
+    }
+    await sendWhatsAppMessage(from, 'Tap a connection from the list above to remove it, or type *cancel*.')
+    return true
+  }
+
+  if (clean && adminSession?.step === 'admin_tree_disconnect_confirm') {
+    if (/^(?:yes|y|disconnect|remove|ok|confirm)$/i.test(lower)) {
+      await finishTreeDisconnect(from, adminSession)
+      return true
+    }
+    if (/^(?:no|keep|cancel)$/i.test(lower)) {
+      await clearSession(from)
+      await sendWhatsAppMessage(from, '✖ Kept as it is.')
+      await showAdminCategoryTree(from)
+      return true
+    }
+    await sendWhatsAppMessage(
+      from,
+      `Tap *✂️ Disconnect* to unlink *${adminSession.data?.treeLink?.child || 'it'}*, or *✖ Keep* to leave it.`
     )
     return true
   }
@@ -4655,6 +5022,7 @@ async function handleAdminCommand(from: string, text: string): Promise<boolean> 
       }
       const result = await connectFeatureRequestToCategory(connectPending, target)
       if (result.ok) {
+        clearCategoryLinkCache()
         const next: ChatSessionData = { ...(adminSession?.data || {}) }
         delete next.connectReqId
         await saveSession(from, 'admin_requests', next)
@@ -4677,7 +5045,7 @@ async function handleAdminCommand(from: string, text: string): Promise<boolean> 
         '🏪 *Add a business for someone else*',
         '',
         'Send the WhatsApp number that will *own* this listing (e.g. 0771234567).',
-        'We will invite that number to complete the registration. The listing, its portal and every cart/order reply will belong to them — not to you.',
+        'You will register the business here - same questions and business-card photo reading. The listing, its portal and every cart/order reply will belong to that number, and the success message comes to you to forward.',
         '',
         'Type *cancel* to stop.',
       ].join('\n')
@@ -5336,7 +5704,52 @@ async function handleAdminCommand(from: string, text: string): Promise<boolean> 
       from,
       renderFeatureRequestList(rows, total) +
         '\n\n✏️ Fix a typo or business detail first: *rewrite req 1 name: … business: … city: …*' +
-        '\nOr approve and rewrite in one line: *approve req 1 name: … category: …*'
+        '\nOr approve and rewrite in one line: *approve req 1 name: … category: …*' +
+        '\nExisting categories: *connect category Tree Cutting to Landscaping*'
+    )
+    return true
+  }
+
+  // Review the category tree: every parent with the categories connected under
+  // it, so an admin can see at a glance what search is treating as one shelf.
+  if (/^(?:categories|category\s+(?:tree|links|connections))$/.test(lower)) {
+    await showAdminCategoryTree(from)
+    return true
+  }
+
+  // Connect one approved category under another: `connect category Tree
+  // Cutting to Landscaping` (the keyword is optional: `connect Tree Cutting to
+  // Landscaping` works too). The connection is stored as the same learned
+  // category link the request flow writes, so search treats both names as one
+  // shelf - and it works even when no pending request is involved.
+  const catConnect = clean.match(
+    /^connect\s+(?:cat(?:egory)?\s+)?(.+?)\s+(?:to|under|as|into|>)\s+(.+)$/i
+  )
+  if (catConnect && !/^req(?:uest)?\b/i.test(catConnect[1])) {
+    const approved = await getApprovedCategories()
+    const child = pickApprovedCategory(approved, catConnect[1])
+    if (!child.name) {
+      await sendWhatsAppMessage(from, `⚠️ ${child.error}`)
+      return true
+    }
+    const parent = pickApprovedCategory(approved, catConnect[2])
+    if (!parent.name) {
+      await sendWhatsAppMessage(from, `⚠️ ${parent.error}`)
+      return true
+    }
+
+    const linked = await linkCategories(child.name, parent.name)
+    if (!linked.ok) {
+      await sendWhatsAppMessage(from, `⚠️ ${linked.error || 'Could not connect those categories.'}`)
+      return true
+    }
+    await sendWhatsAppMessage(
+      from,
+      [
+        `🔗 *${child.name}* is now an element of *${parent.name}*.`,
+        '',
+        'Buyers searching either name will see businesses listed under both.',
+      ].join('\n')
     )
     return true
   }
@@ -5377,6 +5790,7 @@ async function handleAdminCommand(from: string, text: string): Promise<boolean> 
       await sendWhatsAppMessage(from, `${prefix}⚠️ ${result.error || 'Could not connect that request.'}`)
       return true
     }
+    clearCategoryLinkCache()
     const remaining = ids.filter((id: string) => id !== ids[idx])
     await saveSession(from, 'admin_requests', { pendingReqs: remaining, pendingCategoryReqs: remaining } as ChatSessionData)
     await sendWhatsAppMessage(
@@ -5427,6 +5841,7 @@ async function handleAdminCommand(from: string, text: string): Promise<boolean> 
         await sendWhatsAppMessage(from, `${prefix}⚠️ ${result.error || 'Could not connect that request.'}`)
         return true
       }
+      clearCategoryLinkCache()
       const remaining = ids.filter((id: string) => id !== ids[idx])
       await saveSession(from, 'admin_requests', { pendingReqs: remaining } as ChatSessionData)
       await sendWhatsAppMessage(
@@ -5467,6 +5882,8 @@ async function handleAdminCommand(from: string, text: string): Promise<boolean> 
         ? 'Reply with the existing category, e.g. *Hardware* - or *connect req 1 Hardware*.'
         : 'Reply *connect req 1 <existing category>*, e.g. *connect req 1 Hardware*.',
       'Fix the wording at the same time: *connect req 1 category: Hardware name: Hardware & Tools*.',
+      'Connect two existing categories: *connect category Tree Cutting to Landscaping*.',
+      'See the whole tree: *category tree*.',
       'Type *requests* to see the full list, or *approve req 1* if it really is a new category.'
     )
     await sendWhatsAppMessage(from, lines.join('\n'))
@@ -5503,6 +5920,7 @@ async function handleAdminCommand(from: string, text: string): Promise<boolean> 
           await sendWhatsAppMessage(from, `${prefix}⚠️ ${connected.error || 'Could not connect that request.'}`)
           return true
         }
+        clearCategoryLinkCache()
         const remaining = ids.filter((id: string) => id !== ids[idx])
         await saveSession(from, 'admin_requests', { pendingReqs: remaining } as ChatSessionData)
         await sendWhatsAppMessage(
@@ -6482,6 +6900,108 @@ async function handleAction(from: string, session: ChatSession | null, action: s
       await startImageFirstRegister(from)
       return
     }
+    // Admins choose whose business the registration is for. "My business"
+    // runs the normal flow; "Another business" asks for the owner's number and
+    // then runs the same flow with that number owning the listing.
+    case 'reg_for_self': {
+      await startImageFirstRegister(from, { asSelf: true })
+      return
+    }
+    case 'reg_for_other': {
+      if (!(await isBotAdmin(from))) {
+        await startImageFirstRegister(from, { asSelf: true })
+        return
+      }
+      await clearConversationState(from)
+      await saveSession(from, 'admin_add_business', { addingBusiness: true } as ChatSessionData)
+      await sendWhatsAppMessage(
+        from,
+        [
+          '🏬 *Add another business*',
+          '',
+          'Send the WhatsApp number that will *own* this listing (e.g. 0771234567).',
+          'Their number owns the portal and receives cart/order replies; the success message comes to you to forward.',
+          '',
+          'Type *cancel* to stop.',
+        ].join('\n')
+      )
+      return
+    }
+    // ── Interactive category tree ─────────────────────────────────────
+    // The tree message owns the connect/disconnect actions; every branch is a
+    // short guided flow so the admin never has to remember the command syntax.
+    case 'tree_connect': {
+      if (!(await isBotAdmin(from))) return
+      const cur = session || (await getSession(from))
+      await saveSession(from, 'admin_tree_connect_child', {
+        ...(cur?.data || {}),
+        treeConnectChild: undefined,
+        treeConnectParent: undefined,
+        treeLink: undefined,
+      })
+      await sendWhatsAppMessage(
+        from,
+        '🔗 *Connect a branch*\n\nSend the *child* category - the one that should sit under another (e.g. Tree Cutting).\n\nType *cancel* to stop.'
+      )
+      return
+    }
+    case 'tree_connect_yes': {
+      if (!(await isBotAdmin(from))) return
+      await finishTreeConnect(from, session || (await getSession(from)))
+      return
+    }
+    case 'tree_connect_no': {
+      if (!(await isBotAdmin(from))) return
+      await clearSession(from)
+      await sendWhatsAppMessage(from, '✖ Cancelled. Nothing was connected.')
+      await showAdminCategoryTree(from)
+      return
+    }
+    case 'tree_disconnect': {
+      if (!(await isBotAdmin(from))) return
+      const links = await listCategoryConnections()
+      if (!links.length) {
+        await sendWhatsAppMessage(from, '✂️ No connections to remove.')
+        await showAdminCategoryTree(from)
+        return
+      }
+      const shown = links.slice(0, 9)
+      const cur = session || (await getSession(from))
+      await saveSession(from, 'admin_tree_disconnect', {
+        ...(cur?.data || {}),
+        treeLinks: shown,
+        treeLink: undefined,
+      })
+      await sendInteractiveList(
+        from,
+        `✂️ *Disconnect a branch*\n\nTap the connection to remove - both names will search separately again.` +
+          (links.length > shown.length ? `\n\nShowing ${shown.length} of ${links.length}.` : ''),
+        shown.map((link, i) => ({
+          id: `tree_cut_${i}`,
+          title: `${i + 1}. ${link.child}`.slice(0, 24),
+          description: `Under ${link.parent}`.slice(0, 72),
+        })),
+        'Connections'
+      )
+      return
+    }
+    case 'tree_cut_yes': {
+      if (!(await isBotAdmin(from))) return
+      await finishTreeDisconnect(from, session || (await getSession(from)))
+      return
+    }
+    case 'tree_cut_no': {
+      if (!(await isBotAdmin(from))) return
+      await clearSession(from)
+      await sendWhatsAppMessage(from, '✖ Kept as it is.')
+      await showAdminCategoryTree(from)
+      return
+    }
+    case 'tree_done': {
+      await clearSession(from)
+      await sendWhatsAppMessage(from, '🌳 Category tree closed.')
+      return
+    }
     case 'resume_paused': {
       if (!(await resumePaused(from, session || (await getSession(from))))) {
         await sendWhatsAppMessage(from, "That draft has expired - send *register* to start again.")
@@ -6595,7 +7115,7 @@ async function handleAction(from: string, session: ChatSession | null, action: s
     case 'reg_change_phone': {
       const convState = await getConversationState(from)
       if (convState && convState.state.startsWith('REGISTRATION_')) {
-        await handleRegistrationMessage(from, action, convState.context)
+        await runRegistrationAction(from, action, convState.context)
         return
       }
       await startImageFirstRegister(from)
@@ -6624,6 +7144,32 @@ async function handleAction(from: string, session: ChatSession | null, action: s
       return
     default:
       break
+  }
+
+  // Category-tree disconnect rows: the id is the index into the list that was
+  // actually on screen, never a branch re-derived from the category data.
+  const treeCut = action.match(/^tree_cut_([0-9]{1,2})$/)
+  if (treeCut) {
+    if (!(await isBotAdmin(from))) return
+    const cur = session || (await getSession(from))
+    const link = cur?.data.treeLinks?.[Number(treeCut[1])]
+    if (!link) {
+      await sendWhatsAppMessage(from, '⌛ That list expired. Send *category tree* to see the current connections.')
+      return
+    }
+    await saveSession(from, 'admin_tree_disconnect_confirm', {
+      ...(cur?.data || {}),
+      treeLink: link,
+    })
+    await sendInteractiveButtons(
+      from,
+      `Disconnect *${link.child}* from *${link.parent}*?\n\nTheir search results split again.`,
+      [
+        { id: 'tree_cut_yes', title: '✂️ Disconnect' },
+        { id: 'tree_cut_no', title: '✖ Keep' },
+      ]
+    )
+    return
   }
 
   // Pay-flow row taps: payown<N> (own listings) and pay<N> (search results)
@@ -6711,6 +7257,9 @@ async function runSearchAndReply(
   const scope = (scopeRows as BotBusinessRow[]) || []
 
   const category = p.term ? matchCategoryAgainst(p.term, await getApprovedCategories()) : 'Other'
+  // A category an admin connected to another answers to both names, so either
+  // search surfaces the same shops.
+  const categoryNames = await connectedCategoryNames(p.term || '', category)
 
   if (scope.length === 0 && city) {
     // Requested town has no verified businesses at all — fall straight
@@ -6723,7 +7272,7 @@ async function runSearchAndReply(
   }
 
   let results: BotResult[] = []
-  const candidates = scope.filter(b => bizMatchesQuery(b, term, category))
+  const candidates = scope.filter(b => bizMatchesQuery(b, term, categoryNames))
   if (candidates.length > 0) {
     if (p.origin) {
       // "Near me" ranking: plain distance sort from the shared point — no
@@ -6782,7 +7331,8 @@ async function runSearchAndReply(
     const approvedCats = await getApprovedCategories()
     for (const variant of searchVariants(term).slice(0, 4)) {
       const variantCategory = matchCategoryAgainst(variant, approvedCats)
-      if (scope.some(b => bizMatchesQuery(b, variant, variantCategory))) {
+      const variantNames = await connectedCategoryNames(variant, variantCategory)
+      if (scope.some(b => bizMatchesQuery(b, variant, variantNames))) {
         await runSearchAndReply(
           from,
           { term: variant, city: p.city, nationwide: p.nationwide, origin: p.origin },
@@ -6858,7 +7408,7 @@ async function runSearchAndReply(
       .eq('verified', true)
     const all = (allRows as BotBusinessRow[]) || []
     const nearCandidates = all
-      .filter(b => b.city !== city && bizMatchesQuery(b, term, category))
+      .filter(b => b.city !== city && bizMatchesQuery(b, term, categoryNames))
       .sort((a, b) => (b.rating || 0) - (a.rating || 0))
     if (nearCandidates.length > 0) {
       const originRows = all.filter(b => b.city === city && b.lat != null && b.lng != null)
@@ -6912,7 +7462,7 @@ async function runSearchAndReply(
           .filter(s => s && s !== missTerm.toLowerCase())
         for (const alias of aliases.slice(0, 3)) {
           const aliasResults = scope.filter(b =>
-            bizMatchesQuery(b, alias, category)
+            bizMatchesQuery(b, alias, categoryNames)
           )
           if (aliasResults.length > 0) {
             await runSearchAndReply(from, {
@@ -9196,7 +9746,7 @@ export async function POST(request: Request) {
           // Keep the owner on the review card after an edit instead of
           // making them type *proceed* to see their updated listing again.
           if (await handleRegistrationReviewText(from, text, convState)) continue
-          await handleRegistrationMessage(from, text, convState.context)
+          await runRegistrationAction(from, text, convState.context)
           continue
         }
 
