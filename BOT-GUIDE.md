@@ -80,6 +80,60 @@ Pattern for a new button: add a `case` in the button switch; keep titles/ids wit
 6. **Watch logs**: Vercel → project `wa-directory-bot` → Runtime Logs; filter `[onboarding]` events; use a ~30-minute window (Hobby log retention ≈ 1 hour).
 7. **Test in WhatsApp** end-to-end before declaring done.
 
+## 4b. Admin menu, field agents and the pre-deploy checklist
+
+**Admin menu:** send `admin` (or `admin menu`) as an admin. It is one WhatsApp
+list; every row maps to the typed command it replaces (`pending`, `requests`,
+`category tree`, `add business`, `agents`, `listings`, `stats`, `digest`,
+`emergency list`). Menu rows start with `adm_` and are resolved by
+`lib/admin-menu.ts`.
+
+**Field agents:** numbers that only add businesses for other people, mostly by
+photographing street signs. They are stored in `bot_settings.agent_allowlist`
+(JSON array of digits) and are managed from WhatsApp, admin only:
+
+- `agents` - list them
+- `add agent 0771234567` - add one
+- `remove agent 0771234567` - remove one
+
+Agents never receive approval/verification notices: they are not in
+`adminNumbers()`. Their `register` goes straight to the owner-number step. Any
+photo from an agent is held and offered as two buttons - `Register business`
+(asks for the owner number, then reads the sign) or `Search item` (photo
+search) - so a registration photo is never mistaken for a search. The agent
+gets a short success confirmation only; the owner-facing hand-over card goes
+to every admin, prefixed with the agent's number, so an admin forwards it. A
+number that already has a listing cannot be registered again by an agent;
+only the owner may add a second listing on their own number, and when they do
+every admin gets the two businesses side by side. Duplicate blocks offer
+`Another photo` (retake a misread sign) and `Cancel`.
+
+**Human help:** phrases such as `help`, `I need help`, `I want to talk to a
+person`, `real person`, `customer care`, Shona/Ndebele equivalents, or a
+complaint put the chat on hold (`chat_sessions.data.held`) and alert every
+admin with the stage and message. The customer's next messages relay to the
+admins instead of the bot. Admins answer with `reply 263771234567 your message`
+and return the chat with `release 263771234567`. Detection lives in
+`lib/support-intent.ts`; `help me find a plumber` stays a search.
+
+**Photo bursts:** Meta delivers a fast run of photos as separate, concurrent
+webhooks. Shelf batches merge under a per-number lock in `lib/phone-lock.ts`
+(`bot_settings` insert lock) and a per-number in-flight counter, so the batch
+closes only after every photo in the burst has been read. Four photos produce
+four items instead of the last writer overwriting the others or the 5-second
+timer closing while two are still being read.
+
+**Staging:** `STAGING-CHECKLIST.md` is the fixed pre-deploy run. Use one
+dedicated test number, run the checklist, then remove the staging number from
+the admin allowlist and delete test listings.
+
+**Module split:** `src/webhook.ts` is still the router. Off-webhook logic lives
+in `src/registration-intake.ts`, `lib/registration-review.ts`, `lib/agents.ts`,
+`lib/admin-menu.ts`, `lib/admin-category-tree.ts`, `lib/directory-reports.ts`,
+`lib/category-links.ts`, `lib/support-intent.ts` and `lib/phone-lock.ts`. Move a new self-contained flow the same way: pure
+data/formatting into `lib/`, and anything needing the bot senders into a
+factory in `src/` that receives `sendText`/`sendButtons`.
+
 ## 5. Gotchas that have already caused bugs
 
 - `setConversationState()` **replaces the entire context**. To keep collected fields, use `updateConversationContext()` to merge partial updates.

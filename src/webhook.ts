@@ -28,11 +28,6 @@ import {
   updateConversationContext,
   clearConversationState,
   handleRegistrationMessage,
-  analyseBusinessMaterial,
-  categories as sharedCategories,
-  REGISTRATION_BUTTONS,
-  logOnboarding,
-  maskPhone,
 } from '@wa-directory/shared'
 import { TRIAL_PLAN_LABEL, TRIAL_DAYS } from '@wa-directory/shared'
 import {
@@ -79,8 +74,9 @@ import { getAiLimitStatus, renderAiLimitNotice } from '@wa-directory/shared'
 import { createListing } from '@wa-directory/shared'
 import { uploadLogoImage } from '@wa-directory/shared'
 import { fetchWhatsAppMedia, perceiveMedia, mediaRateOk, recognizeShelfItems, priceFromCaption, stripPriceFromCaption, parseMoney, type MediaKind, type MediaSense } from '../lib/bot-sense.js'
-import { extractBusinessCardFast, hasRequiredCardField, type FastCardFields } from '../lib/card-ocr.js'
 import { renderSocialReply } from '../lib/social-intent.js'
+import { isSupportRequest } from '../lib/support-intent.js'
+import { withPhoneLock } from '../lib/phone-lock.js'
 import { semanticPhotoHint, type SemanticHint } from '../lib/semantic-search.js'
 import {
   parseListingMessage,
@@ -130,7 +126,49 @@ import type { PlanType } from '@wa-directory/shared'
 import { SITE_URL } from '@wa-directory/shared'
 import { digitsOnly } from '@wa-directory/shared'
 import { searchVariants, matchesSearchTerm } from '@wa-directory/shared'
-import { connectedCategoryNames, listingHasCategory, clearCategoryLinkCache, linkCategories, categoryTree, listCategoryConnections, unlinkCategory, type CategoryTreeNode } from '../lib/category-links.js'
+import { connectedCategoryNames, listingHasCategory, clearCategoryLinkCache, linkCategories, listCategoryConnections, unlinkCategory } from '../lib/category-links.js'
+import {
+  agentNumbers,
+  isAgent,
+  addAgent,
+  removeAgent,
+  findBusinessesByPhone,
+  duplicateBusinessLines,
+  normalizeOwnerPhone,
+  type ListedBusiness,
+} from '../lib/agents.js'
+import {
+  ADMIN_MENU_BUTTON,
+  ADMIN_MENU_ROWS,
+  adminMenuBody,
+  adminMenuCommand,
+} from '../lib/admin-menu.js'
+import {
+  createAdminCategoryTree,
+  pickApprovedCategory,
+} from '../lib/admin-category-tree.js'
+import {
+  buildRegistrationListing,
+  parseRegistrationReviewEdit,
+  registrationField,
+  type RegistrationReviewEdit,
+} from '../lib/registration-review.js'
+import {
+  createRegistrationIntake,
+  registrationOwnerContext,
+} from './registration-intake.js'
+import {
+  listUnverifiedBusinesses,
+  listRecentBusinesses,
+  listDirectoryRows,
+  contactChunkMessages,
+  listChatCsvRows,
+  listBizCsvRows,
+  csvForBusinesses,
+  csvForPeople,
+  csvForChats,
+  type DirectoryRow,
+} from '../lib/directory-reports.js'
 import { listEmergencyContacts, addEmergencyContact, deleteEmergencyContact, clearEmergencyContacts, findEmergencyNear, parseEmergencyAdd, emergencyWaLink, categoryIcon, VALID_CATEGORIES } from '../lib/emergency.js'
 import {
   CHAT_OPEN_MARKER,
@@ -227,6 +265,17 @@ import {
   verifiedListingFor,
 } from '../lib/radar.js'
 
+/**
+ * WhatsApp webhook router: verify Meta, read each inbound message, then route.
+ * Feature logic is split into focused modules:
+ *  - src/registration-intake.ts: card/sign reading, missing fields, review card
+ *  - lib/registration-review.ts: listing build + "City: X" corrections
+ *  - lib/agents.ts: field-agent allowlist + duplicate lookups
+ *  - lib/admin-menu.ts: admin list + tap-to-command mapping
+ *  - lib/admin-category-tree.ts: interactive category tree
+ *  - lib/directory-reports.ts: listings, directory and CSV exports
+ *  - lib/category-links.ts: connected categories and search expansion
+ */
 const WEBHOOK_VERIFY_TOKEN = process.env.WEBHOOK_VERIFY_TOKEN
 // Verify Meta's X-Hub-Signature-256 over the raw request body. Fail closed:
 // if WHATSAPP_APP_SECRET is unset, no inbound payload can be authenticated, so
@@ -279,7 +328,7 @@ async function helpText(from?: string): Promise<string> {
 
   // We only list businesses now and payments are paused, so the shared help
   // copy's personal-contact and EcoCash lines are hidden from the bot.
-  return helpLines
+  const rendered = helpLines
     .filter(
       line =>
         !/personal contacts?/i.test(line) &&
@@ -290,6 +339,13 @@ async function helpText(from?: string): Promise<string> {
     )
     .join('\n')
     .replace(/\n{3,}/g, '\n\n')
+  if (from && (await isBotAdmin(from))) {
+    return `${rendered}\n\n🛠️ *Admin:* send *admin* for the button menu.`
+  }
+  if (from) {
+    return `${rendered}\n\n💬 *Need a person?* Send *I need help* and an admin will join this chat.`
+  }
+  return rendered
 }
 
 // Cancelling used to answer with the full help guide — for a number that owns
@@ -319,192 +375,6 @@ async function isBotAdmin(from: string): Promise<boolean> {
 
 function fmtAdminNumber(n: string): string {
   return `+${n}`
-}
-
-interface PendingBusiness {
-  id: string
-  name: string
-  phone: string | null
-  city: string | null
-  created_at: string
-}
-
-async function listUnverifiedBusinesses(limit = 10): Promise<PendingBusiness[]> {
-  try {
-    const { data } = await getSupabase()
-      .from('businesses')
-      .select('id, name, phone, city, created_at')
-      .eq('verified', false)
-      .order('created_at', { ascending: false })
-      .limit(limit)
-    return (data as PendingBusiness[]) || []
-  } catch {
-    return []
-  }
-}
-
-// Newest businesses regardless of state — the "listings" admin view.
-type BusinessSummary = {
-  id: number
-  name: string
-  username: string | null
-  city: string | null
-  verified: boolean
-  payment_status: string | null
-  created_at: string
-}
-
-async function listRecentBusinesses(limit = 10): Promise<BusinessSummary[]> {
-  try {
-    const { data } = await getSupabase()
-      .from('businesses')
-      .select('id, name, username, city, verified, payment_status, created_at')
-      .order('created_at', { ascending: false })
-      .limit(limit)
-    return (data as BusinessSummary[]) || []
-  } catch {
-    return []
-  }
-}
-
-// The whole directory (businesses + personal contacts share the businesses
-// table; personal rows carry 'Personal Contact' in their category array).
-// Expired listings are excluded — renewals are tracked elsewhere (bot-only
-// duplication with the Subscriptions tab is intentional).
-type DirectoryRow = {
-  id: number
-  name: string
-  city: string | null
-  phone: string
-  phone_type: string | null
-  category: string[] | null
-}
-
-async function listDirectoryRows(limit = 600): Promise<DirectoryRow[]> {
-  try {
-    const { data } = await getSupabase()
-      .from('businesses')
-      .select('id, name, city, phone, phone_type, category')
-      .neq('payment_status', 'expired')
-      .order('name', { ascending: true })
-      .limit(limit)
-    return (data as DirectoryRow[]) || []
-  } catch {
-    return []
-  }
-}
-
-// Rows are pre-blocked at ~38 lines so each WhatsApp message stays well
-// under the 4KB media limit even after bold + emoji widening.
-function contactChunkMessages(
-  header: string,
-  rows: Array<{ name: string; city: string | null; phone: string; phoneType: string | null }>,
-  startIndex = 0
-): string[] {
-  const lines = rows.map((r, i) => {
-    const num = formatPhone(r.phone) || 'no number'
-    return `${startIndex + i + 1}. *${r.name}* · ${r.city || '-'} · ${num}${r.phoneType === 'voice' ? ' 📞' : ''}`
-  })
-  if (lines.length === 0) return []
-  const pageSize = 38
-  const pages: string[] = []
-  for (let i = 0; i < lines.length; i += pageSize) {
-    const part = lines.slice(i, i + pageSize)
-    pages.push(
-      i === 0
-        ? [header, `${rows.length} listed`, '', ...part].join('\n')
-        : ['…cont.', '', ...part].join('\n')
-    )
-  }
-  return pages
-}
-
-// Everyone who has ever messaged the bot — the engagement list.
-type ChatCsvRow = {
-  phone: string
-  name: string | null
-  first_seen: string | null
-  last_seen: string | null
-  message_count: number | null
-  last_step: string | null
-  opted_out: boolean | null
-}
-
-async function listChatCsvRows(limit = 200): Promise<ChatCsvRow[]> {
-  try {
-    const { data } = await getSupabase()
-      .from('bot_contacts')
-      .select('phone, name, first_seen, last_seen, message_count, last_step, opted_out')
-      .order('message_count', { ascending: false })
-      .order('last_seen', { ascending: false })
-      .limit(limit)
-    return (data as ChatCsvRow[]) || []
-  } catch {
-    return []
-  }
-}
-
-// ── CSV exports (admin) ───────────────────────────────────────────────────
-function csvEsc(value: unknown): string {
-  const s = String(value ?? '')
-  return /[",\n]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s
-}
-
-function csvBody(headers: string[], rows: unknown[][]): string {
-  const lines = [headers.join(','), ...rows.map(r => r.map(csvEsc).join(','))]
-  return lines.join('\r\n') + '\r\n'
-}
-
-type BizCsvRow = {
-  name: string
-  username: string | null
-  city: string | null
-  phone: string
-  phone_type: string | null
-  verified: boolean
-  payment_status: string | null
-  created_at: string | null
-  socials: string[] | null
-  category: string[] | null
-}
-
-async function listBizCsvRows(): Promise<BizCsvRow[]> {
-  try {
-    const { data } = await getSupabase()
-      .from('businesses')
-      .select('name, username, city, phone, phone_type, verified, payment_status, created_at, socials, category')
-      .neq('payment_status', 'expired')
-      .order('name', { ascending: true })
-      .limit(600)
-    return (data as BizCsvRow[]) || []
-  } catch {
-    return []
-  }
-}
-
-function csvForBusinesses(rows: BizCsvRow[]): string {
-  return csvBody(
-    ['name', 'username', 'city', 'phone', 'phone_type', 'verified', 'payment_status', 'created_at'],
-    rows
-      .filter(r => !(r.category || []).includes('Personal Contact'))
-      .map(r => [r.name, r.username || '', r.city || '', r.phone, r.phone_type || 'whatsapp', r.verified ? 'true' : 'false', r.payment_status || '', r.created_at || ''])
-  )
-}
-
-function csvForPeople(rows: BizCsvRow[]): string {
-  return csvBody(
-    ['name', 'city', 'phone', 'phone_type', 'socials', 'created_at'],
-    rows
-      .filter(r => (r.category || []).includes('Personal Contact'))
-      .map(r => [r.name, r.city || '', r.phone, r.phone_type || 'whatsapp', (r.socials || []).join(' | '), r.created_at || ''])
-  )
-}
-
-function csvForChats(rows: ChatCsvRow[]): string {
-  return csvBody(
-    ['name', 'phone', 'first_seen', 'last_seen', 'notes', 'last_step', 'opted_out'],
-    rows.map(r => [r.name || '', r.phone, r.first_seen || '', r.last_seen || '', r.message_count ?? 0, r.last_step || '', r.opted_out ? 'true' : 'false'])
-  )
 }
 
 // ── Transcript logging ────────────────────────────────────────────────────
@@ -1673,21 +1543,16 @@ async function resumePaused(from: string, session: ChatSession | null): Promise<
 // Zimbabwe phone entry from an admin: 0771234567 and +263771234567 both
 // normalize to 263771234567, which is the number the listing - and therefore
 // the portal account - will belong to.
-function normalizeRegistrationOwner(raw: string): string {
-  const digits = digitsOnly(raw)
-  if (!digits) return ''
-  if (digits.startsWith('00')) return digits.slice(2)
-  if (digits.startsWith('0')) return `263${digits.slice(1)}`
-  return digits
-}
+// Kept as a local alias: every registration call site already uses this name.
+const normalizeRegistrationOwner = normalizeOwnerPhone
 
-function registrationOwnerContext(context: any): { onBehalfOf?: string; regForSelf?: boolean } {
-  const owner = typeof context?.onBehalfOf === 'string' ? normalizeRegistrationOwner(context.onBehalfOf) : ''
-  return {
-    ...(owner ? { onBehalfOf: owner } : {}),
-    ...(context?.regForSelf === true ? { regForSelf: true } : {}),
-  }
-}
+// The image intake + review card live in src/registration-intake.ts.
+const registrationIntake = createRegistrationIntake({
+  sendText: (to, body) => sendWhatsAppMessage(to, body),
+  sendButtons: (to, body, buttons) => sendInteractiveButtons(to, body, buttons),
+})
+const handleRegistrationImageResilient = registrationIntake.handleImage
+const sendRegistrationReview = registrationIntake.sendRegistrationReview
 
 // Admins can list a business they do not own. The same registration flow runs
 // on their chat, but the listing phone (and so the portal account) is the
@@ -1723,10 +1588,17 @@ async function startImageFirstRegister(
     : normalizeRegistrationOwner(opts.onBehalfOf || '') ||
       (typeof prior?.onBehalfOf === 'string' ? normalizeRegistrationOwner(prior.onBehalfOf) : '')
   const asSelf = opts.asSelf === true || (!owner && prior?.regForSelf === true)
+  const fromAgent = await isAgent(from)
 
   // An admin starting a registration chooses whose business it is first.
   if (!owner && !asSelf && (await isBotAdmin(from))) {
     await showAdminRegistrationChoice(from)
+    return
+  }
+  // Agents only ever register someone else's business, so they go straight to
+  // the owner-number step instead of the self/other choice.
+  if (!owner && !asSelf && fromAgent) {
+    await promptOwnerNumber(from, true)
     return
   }
 
@@ -1756,7 +1628,10 @@ async function startImageFirstRegister(
     owner
       ? `🏬 *Adding a business for +${owner}*\n\n` +
           'Send its business card, flyer, banner or advert and our AI will read the details, or enter them manually.\n\n' +
-          `The listing and portal will belong to +${owner} - not to you. You will get the success message, portal link and website to forward to them.`
+          `The listing and portal will belong to +${owner} - not to you. ` +
+          (fromAgent
+            ? 'The hand-over card goes to our admins to forward; you get a short confirmation only.'
+            : 'You will get the success card, portal link and website to forward to them.')
       : "🏪 *Let's get your business listed!*\n\n" +
           'Have a business card, flyer, banner or advert? Send us a picture and our AI ' +
           'will extract the business information it can identify, saving you time.\n\n' +
@@ -1771,290 +1646,6 @@ async function startImageFirstRegister(
 async function sendRegisterChoice(from: string) {
   await startImageFirstRegister(from)
 }
-
-// ── Registration image intake ────────────────────────────────────────────
-// The full structured extractor asks for a large schema and can spend 50s
-// before it gives up. Read the five required card details with a short prompt
-// first; only fall back to the full extractor when that quick read finds
-// nothing and still finished quickly enough to leave it time to run.
-const REGISTRATION_REQUIRED = ['business_name', 'category', 'phone', 'city', 'description'] as const
-const REGISTRATION_FIELD_LABELS: Record<(typeof REGISTRATION_REQUIRED)[number], string> = {
-  business_name: 'Business name',
-  category: 'Category',
-  phone: 'WhatsApp / phone number',
-  city: 'City or town',
-  description: 'What your business offers',
-}
-
-function registrationPromptForField(field: string): string {
-  switch (field) {
-    case 'business_name':
-      return 'What is your business name?'
-    case 'category':
-      return 'Which category best describes your business? (e.g. Food & Restaurant, Hardware, Clothing & Fashion)'
-    case 'phone':
-      return 'Which phone number should customers use on WhatsApp?'
-    case 'city':
-      return '📍 Which city or town is your business in?'
-    case 'description':
-      return 'In a few words, what products or services does your business offer?'
-    default:
-      return `Please provide: ${field}`
-  }
-}
-
-function registrationExtractedField(value: string, confidence = 0.7) {
-  return {
-    value,
-    confidence,
-    source: 'uploaded_material' as const,
-    evidence: 'fast_card_read',
-    needs_confirmation: false,
-    status: 'suggested' as const,
-  }
-}
-
-async function fieldsFromFastCard(fast: FastCardFields) {
-  const fields: Record<string, ReturnType<typeof registrationExtractedField>> = {}
-  const add = (key: string, value: string) => {
-    if (value) fields[key] = registrationExtractedField(value)
-  }
-
-  add('business_name', fast.business_name)
-  const rawCategory = fast.category
-  if (rawCategory) {
-    // Use the in-code category list here: the fast path must not wait on a
-    // Supabase lookup after the vision call.
-    const mapped = matchCategoryAgainst(rawCategory, sharedCategories)
-    if (mapped && mapped !== 'Other') add('category', mapped)
-    else {
-      // Keep the owner's wording so a human can confirm the category rather
-      // than filing the listing under a guess.
-      add('category', rawCategory)
-      fields.requested_category = registrationExtractedField(rawCategory)
-    }
-  }
-  add('phone', fast.phone)
-  add('city', fast.city)
-  add('description', fast.description)
-  add('website', fast.website)
-  add('address', fast.address)
-  add('area', fast.area)
-  add('price_range', fast.price_range)
-  return fields
-}
-
-async function applyRegistrationExtraction(
-  from: string,
-  fields: Record<string, any>,
-  opts: {
-    approvedPlan?: 'trial' | PlanType
-    trialRequested: boolean
-    draft?: any
-    source: string
-    onBehalfOf?: string
-    regForSelf?: boolean
-  }
-) {
-  // The owner's number wins over whatever the card says: it is the number the
-  // listing (and its portal account) belongs to.
-  if (opts.onBehalfOf) {
-    fields = {
-      ...fields,
-      phone: registrationExtractedField(opts.onBehalfOf, 1),
-    }
-  }
-  const missing = REGISTRATION_REQUIRED.filter((key) => !fields?.[key]?.value)
-  const draft = opts.draft || {
-    fields,
-    missing_required_fields: missing,
-    next_questions: [],
-    warnings: [],
-    model: 'fast_card_read',
-    analysed_at: new Date().toISOString(),
-  }
-  const context = {
-    step: missing.length ? 'collecting_missing' : 'review_extracted',
-    approvedPlan: opts.approvedPlan,
-    trialRequested: opts.trialRequested,
-    draft,
-    fields,
-    missing,
-    currentMissingIndex: 0,
-    ...(opts.onBehalfOf ? { onBehalfOf: opts.onBehalfOf } : {}),
-    ...(opts.regForSelf ? { regForSelf: true } : {}),
-  }
-
-  if (missing.length) {
-    const saved = await setConversationState(from, 'REGISTRATION_COLLECTING_FIELDS', context)
-    if (!saved) {
-      await sendWhatsAppMessage(from, '⚠️ Something went wrong saving your listing. Please send the picture again.')
-      return
-    }
-    logOnboarding('registration_image_extracted', {
-      phone: maskPhone(from),
-      missing: missing.length,
-      source: opts.source,
-    })
-    const found = registrationReviewLines(context)
-    const foundBlock = found.length ? `${found.join('\n')}\n\n` : ''
-    const missingBlock = missing.map((key) => `○ ${REGISTRATION_FIELD_LABELS[key]}`).join('\n')
-    const heading =
-      opts.source === 'fast_card'
-        ? '🔍 *Quick read of your business information*'
-        : '🔍 *We read your business information*'
-    await sendWhatsAppMessage(
-      from,
-      `${heading}\n\n${foundBlock}We still need:\n${missingBlock}\n\n${registrationPromptForField(missing[0])}`
-    )
-    return
-  }
-
-  const saved = await setConversationState(from, 'REGISTRATION_REVIEW_EXTRACTED', context)
-  if (!saved) {
-    await sendWhatsAppMessage(from, '⚠️ Something went wrong saving your listing. Please send the picture again.')
-    return
-  }
-  logOnboarding('registration_image_extracted', {
-    phone: maskPhone(from),
-    missing: 0,
-    source: opts.source,
-  })
-  await sendRegistrationReview(from, context)
-}
-
-async function handleRegistrationImageResilient(from: string, bytes: Uint8Array, caption: string) {
-  const previous = await getConversationState(from)
-  const approvedPlan = previous?.context?.approvedPlan as 'trial' | PlanType | undefined
-  const trialRequested =
-    previous?.context?.trialRequested === true || approvedPlan === 'trial'
-  const ownerContext = registrationOwnerContext(previous?.context)
-
-  await setConversationState(from, 'REGISTRATION_PROCESSING_IMAGE', {
-    step: 'processing',
-    approvedPlan,
-    trialRequested,
-    ...ownerContext,
-  })
-  logOnboarding('registration_image_received', { phone: maskPhone(from) })
-  await sendWhatsAppMessage(from, '🔍 Reading your business material with AI... Please give us a moment.')
-
-  const started = Date.now()
-  let fast: FastCardFields | null = null
-  try {
-    fast = await extractBusinessCardFast(bytes, caption)
-  } catch (err) {
-    console.error('[bot-media] fast card read failed:', err)
-  }
-  const elapsed = Date.now() - started
-
-  if (hasRequiredCardField(fast)) {
-    await applyRegistrationExtraction(from, await fieldsFromFastCard(fast!), {
-      approvedPlan,
-      trialRequested,
-      source: 'fast_card',
-      ...ownerContext,
-    })
-    return
-  }
-
-  // A quick miss leaves room for the full extractor. A timeout does not: the
-  // user would wait another 50s only to be told the same thing.
-  if (elapsed < 8_000) {
-    try {
-      const outcome = await analyseBusinessMaterial(
-        [bytes],
-        sharedCategories.map((category) => category.name)
-      )
-      if (outcome.ok) {
-        await applyRegistrationExtraction(from, outcome.draft.fields as any, {
-          approvedPlan,
-          trialRequested,
-          draft: outcome.draft,
-          source: 'structured',
-          ...ownerContext,
-        })
-        return
-      }
-    } catch (err) {
-      console.error('[bot-media] registration image analysis error:', err)
-    }
-  }
-
-  await setConversationState(from, 'REGISTRATION_AWAITING_IMAGE', {
-    step: 'choose_material',
-    approvedPlan,
-    trialRequested,
-    ...ownerContext,
-  })
-  logOnboarding('registration_image_failed', {
-    phone: maskPhone(from),
-    reason: fast ? 'no_fields' : 'fast_timeout',
-  })
-  await sendInteractiveButtons(
-    from,
-    `⚠️ *We couldn't read the information in that image.*\n\n` +
-      `You can try another picture or enter your details manually.`,
-    [
-      { id: REGISTRATION_BUTTONS.upload, title: '📷 Try another picture' },
-      { id: REGISTRATION_BUTTONS.skip, title: 'Enter manually' },
-    ]
-  )
-}
-
-// ── Registration review: edit without typing "proceed" ───────────────────
-// The shared flow's OCR review used to reply "type proceed" after one edit.
-// Owners should see the updated listing again with Publish and Edit buttons,
-// so a correction never costs them another command.
-type RegistrationReviewEdit = { key: string; label: string; value: string }
-
-function parseRegistrationReviewEdit(text: string): RegistrationReviewEdit | null {
-  const m = text.match(/^(?:edit\s+)?([A-Za-z][A-Za-z ]{2,20}?)\s*:\s*([\s\S]+)$/i)
-  if (!m) return null
-  const label = m[1].trim().toLowerCase()
-  const value = m[2].trim()
-  if (!value || value.length > 400) return null
-  if (label.includes('call') || label.includes('telephone')) return { key: 'calls', label: 'Calls number', value }
-  if (label.includes('name')) return { key: 'business_name', label: 'Business name', value }
-  if (label.includes('categor')) return { key: 'category', label: 'Category', value }
-  if (label.includes('city') || label.includes('town')) return { key: 'city', label: 'City', value }
-  if (label.includes('phone') || label.includes('whatsapp') || label.includes('number')) return { key: 'phone', label: 'WhatsApp number', value }
-  if (label.includes('description') || label.includes('offer') || label.includes('bio')) return { key: 'description', label: 'Description', value }
-  if (label.includes('website') || label.includes('site')) return { key: 'website', label: 'Website', value }
-  if (label.includes('address')) return { key: 'address', label: 'Physical address', value }
-  if (label.includes('area') || label.includes('suburb')) return { key: 'area', label: 'Area', value }
-  if (label.includes('price')) return { key: 'price_range', label: 'Price range', value }
-  return null
-}
-
-function registrationField(fields: Record<string, { value?: string } | undefined> | undefined, key: string): string {
-  return (fields?.[key]?.value || '').toString().trim()
-}
-
-function buildRegistrationListing(
-  fields: Record<string, { value?: string } | undefined> | undefined,
-  ownerPhone?: string
-) {
-  // An on-behalf registration seeds the owner's number into `phone`, so an
-  // admin edit still wins; the stored owner number is only a fallback.
-  const cardPhone = registrationField(fields, 'phone')
-  const phone = cardPhone || normalizeRegistrationOwner(ownerPhone || '')
-  return {
-    name: registrationField(fields, 'business_name'),
-    categories: [registrationField(fields, 'category') || 'Other'],
-    city: registrationField(fields, 'city'),
-    phone,
-    area: registrationField(fields, 'area'),
-    description: registrationField(fields, 'description'),
-    website: registrationField(fields, 'website'),
-    address: registrationField(fields, 'address'),
-    calls: registrationField(fields, 'calls'),
-    priceRange: registrationField(fields, 'price_range'),
-    requestedCategory: registrationField(fields, 'requested_category'),
-    notify: false,
-  }
-}
-
 async function applyRegistrationReviewEdit(from: string, context: any, edit: RegistrationReviewEdit) {
   const fields = { ...(context.fields || {}) }
   fields[edit.key] = { value: edit.value, confidence: 1, status: 'suggested' }
@@ -2062,63 +1653,6 @@ async function applyRegistrationReviewEdit(from: string, context: any, edit: Reg
   const listing = buildRegistrationListing(fields, context.onBehalfOf)
   await updateConversationContext(from, { fields, listing })
   return { fields, listing }
-}
-
-function registrationReviewLines(context: any): string[] {
-  const fields = context.fields || {}
-  const rows: Array<[string, string]> = [
-    ['Name', registrationField(fields, 'business_name')],
-    ['Category', registrationField(fields, 'category')],
-    ['City', registrationField(fields, 'city')],
-    ['Phone', registrationField(fields, 'phone')],
-    ['Calls', registrationField(fields, 'calls')],
-    ['Area', registrationField(fields, 'area')],
-    ['Description', registrationField(fields, 'description')],
-    ['Website', registrationField(fields, 'website')],
-    ['Address', registrationField(fields, 'address')],
-    ['Prices', registrationField(fields, 'price_range')],
-  ]
-  const described = registrationField(fields, 'requested_category')
-  const lines = rows.filter(([, value]) => value).map(([label, value]) => `✓ ${label}: ${value}`)
-  if (described) lines.push(`· Category you described: ${described} (our team confirms this)`)
-  if (context.password) lines.push('✓ Portal password: set')
-  return lines
-}
-
-async function sendRegistrationReview(
-  from: string,
-  context: any,
-  opts: { updated?: string; hint?: string } = {}
-) {
-  const step = context?.step === 'final_review' ? 'final_review' : 'review_extracted'
-  const lines = registrationReviewLines(context)
-  const body = [
-    opts.updated || '',
-    '🏪 *Your listing — Ready to publish*',
-    '',
-    ...lines,
-    '',
-    opts.hint || 'Reply `City: Bulawayo` to change a detail (or `edit City: Bulawayo`).',
-  ]
-    .filter((line, i, all) => line || all[i - 1])
-    .join('\n')
-  const buttons: InteractiveButton[] =
-    step === 'final_review'
-      ? [
-          { id: 'reg_publish', title: '🚀 Publish listing' },
-          { id: 'reg_edit', title: '✏️ Edit details' },
-          { id: 'reg_cancel', title: '✖ Cancel' },
-        ]
-      : [
-          { id: 'reg_review_publish', title: '🚀 Publish listing' },
-          { id: 'reg_edit', title: '✏️ Edit details' },
-        ]
-  if (body.length <= 1000) {
-    await sendInteractiveButtons(from, body, buttons)
-  } else {
-    await sendWhatsAppMessage(from, body)
-    await sendInteractiveButtons(from, 'Ready to publish?', buttons)
-  }
 }
 
 async function publishRegistrationReview(from: string, state: any) {
@@ -2135,10 +1669,9 @@ async function publishRegistrationReview(from: string, state: any) {
   await runRegistrationAction(from, 'publish', finalContext)
 }
 
-// After an on-behalf registration is published the admin gets one compact,
-// forwardable card: who owns it, the portal and the listing/website link. The
-// shared flow's own success message already went to this chat, so this is the
-// hand-over summary for the new business.
+// After an on-behalf registration is published, build one polite card the
+// business can receive. Admins forward it themselves; for an agent it goes to
+// the admins with the agent named, and the agent only gets a confirmation.
 async function sendAdminRegistrationSummary(from: string, ownerPhone: string) {
   const state = await getConversationState(from)
   const context = state?.context || {}
@@ -2146,36 +1679,147 @@ async function sendAdminRegistrationSummary(from: string, ownerPhone: string) {
 
   const { data: biz } = await getSupabase()
     .from('businesses')
-    .select('name, slug, business_id, username, website')
+    .select('name, slug, business_id, username, website, edit_token')
     .eq('id', context.businessId)
     .maybeSingle()
   if (!biz) return
 
   const profile = biz.slug ? `${SITE_URL}/business/${biz.slug}` : ''
-  const lines = [
-    '📤 *Registered - forward this to the business*',
+  const setup = biz.edit_token
+    ? `${SITE_URL}/account-setup?token=${biz.edit_token}`
+    : ''
+  const card = [
+    `🏪 *${biz.name}* is now on WA Directory`,
     '',
-    `Business: *${biz.name}*`,
-    `Owner WhatsApp: +${ownerPhone}`,
+    `Hello! A WA Directory field agent registered *${biz.name}* for you today.` +
+      ' Submitting a listing is free and nothing has been charged.',
+    '',
     `Business ID: ${biz.business_id}`,
     ...(biz.username ? [`Username: @${biz.username}`] : []),
-    ...(biz.website ? [`Website: ${biz.website}`] : []),
-    ...(profile ? [`Listing${biz.website ? '' : ' / free website'}: ${profile}`] : []),
+    ...(profile ? [`Your listing: ${profile}`] : []),
+    ...(biz.website ? [`Your website: ${biz.website}`] : []),
     `Portal: ${SITE_URL}/login`,
+    ...(setup ? [`First time? Set your password here: ${setup}`] : []),
     '',
-    `Their portal account is under +${ownerPhone}. Forward this card and the success message above to them.`,
-  ]
-  await sendWhatsAppMessage(from, lines.join('\n'))
+    `Your number +${ownerPhone} owns this listing - customer replies, orders and edits all come to you.`,
+    '',
+    'Keep this message for your login details. Reply *help* here any time.',
+  ].join('\n')
+
+  if (await isAgent(from)) {
+    await notifyAdminsText(
+      [
+        '📤 *Agent registration - forward to the business*',
+        `Agent: +${normalizeRegistrationOwner(from)}`,
+        `Owner: +${ownerPhone}`,
+        '',
+        'Forward the card below to the owner. Nothing was charged.',
+        '',
+        card,
+      ].join('\n')
+    )
+    await sendWhatsAppMessage(
+      from,
+      [
+        `✅ *${biz.name}* is listed under +${ownerPhone}.`,
+        '',
+        'The hand-over card has gone to the admins to forward. You do not need to send anything to the owner.',
+      ].join('\n')
+    )
+    return
+  }
+
+  await sendWhatsAppMessage(
+    from,
+    ['📤 *Forward this card to the business*', '', card].join('\n')
+  )
 }
 
-/** Registration turn wrapper: keeps the on-behalf owner attached and sends
- * the admin hand-over card once publishing succeeded. */
+/** Show the admins every listing on one owner's number. */
+async function notifyDuplicateRows(rows: ListedBusiness[]): Promise<void> {
+  if (rows.length < 2) return
+  const listingPhone = normalizeRegistrationOwner(rows[0]?.phone || '')
+  await notifyAdminsText(
+    [
+      '🏪 *Owner added a second listing*',
+      `+${listingPhone} now has ${rows.length} listings:`,
+      '',
+      ...rows.map(
+        (row, index) =>
+          `${index + 1}. *${row.name}* · ${row.business_id}` +
+          (row.created_at ? ` · ${String(row.created_at).slice(0, 10)}` : '')
+      ),
+      '',
+      'This is allowed only because the owner registered it themselves. Check both if it looks like the same business.'
+    ].join('\n')
+  )
+}
+
+/** After an owner publishes a second listing on the same number, show the
+ * admins both records - the repeat is allowed, but it should be visible. */
+async function notifyOwnerDuplicateListing(
+  from: string,
+  listingPhone: string,
+  existing: ListedBusiness[]
+): Promise<void> {
+  const state = await getConversationState(from)
+  const newId = state?.context?.businessId
+  if (state?.state !== 'AWAITING_ADMIN_REVIEW' || !newId) return
+  const { data: created } = await getSupabase()
+    .from('businesses')
+    .select('id, name, business_id, phone, category, created_at')
+    .eq('id', newId)
+    .maybeSingle()
+  if (!created) return
+  await notifyDuplicateRows([...existing, created as ListedBusiness])
+}
+
+/** Registration turn wrapper: keeps the on-behalf owner attached, blocks a
+ * second listing on a number the sender does not own, sends the admin
+ * hand-over card once publishing succeeded, and reports an owner's repeat
+ * listing to the admins. */
 async function runRegistrationAction(from: string, action: string, context: any) {
   const owner =
     typeof context?.onBehalfOf === 'string' ? normalizeRegistrationOwner(context.onBehalfOf) : ''
+  const publishing = /^(?:publish|reg_publish)$/i.test(action.trim())
+  const listingPhone = normalizeRegistrationOwner(
+    registrationField(context?.fields, 'phone') || owner
+  )
+  const existing = publishing && listingPhone ? await findBusinessesByPhone(listingPhone) : []
+
+  // Only the owner may hold two listings on one number. An agent (or an admin)
+  // adding for someone is refused, and so is a person keying in a number that
+  // is not their own.
+  if (publishing && existing.length) {
+    const senderOwnsNumber = normalizeRegistrationOwner(from) === listingPhone
+    if (owner || !senderOwnsNumber) {
+      await sendInteractiveButtons(
+        from,
+        [
+          '⚠️ *That number is already listed*',
+          '',
+          ...duplicateBusinessLines(existing),
+          '',
+          owner
+            ? 'Only the owner can add a second listing on the same number. Ask them to register it themselves, or retake the photo if the number was read wrong.'
+            : 'You can only add another listing on a number you own. Retake the photo if the number was read wrong.',
+          '',
+          'Nothing was published.',
+        ].join('\n'),
+        [
+          { id: 'reg_duplicate_photo', title: '📷 Another photo' },
+          { id: 'reg_cancel', title: '✖ Cancel' },
+        ]
+      )
+      return
+    }
+  }
+
   await handleRegistrationMessage(from, action, context)
-  if (owner && /^(?:publish|reg_publish)$/i.test(action.trim())) {
+  if (owner && publishing) {
     await sendAdminRegistrationSummary(from, owner)
+  } else if (!owner && publishing && existing.length && listingPhone) {
+    await notifyOwnerDuplicateListing(from, listingPhone, existing)
   }
 }
 
@@ -2416,6 +2060,26 @@ async function tryPublishForm(from: string, session: ChatSession, msgId?: string
     await sendFormUpdate(from, state)
     return
   }
+
+  // Same duplicate rule as the photo flow: only the owner may hold two
+  // listings on one number, and the admins should see both when they do.
+  const listingPhone = normalizeRegistrationOwner(state.phone || from)
+  const before = listingPhone ? await findBusinessesByPhone(listingPhone) : []
+  if (before.length && listingPhone !== normalizeRegistrationOwner(from)) {
+    await sendWhatsAppMessage(
+      from,
+      [
+        '⚠️ *That number is already listed*',
+        '',
+        ...duplicateBusinessLines(before),
+        '',
+        'You can only add another listing on a number you own. Ask the owner to register it themselves.',
+        '',
+        'Nothing was published.',
+      ].join('\n')
+    )
+    return
+  }
   // Lift the flat form state into the registration shape publishBusiness
   // already consumes (written through the shared listing engine).
   const merged: ChatSessionData = {
@@ -2435,6 +2099,11 @@ async function tryPublishForm(from: string, session: ChatSession, msgId?: string
     description: state.description,
   }
   await publishBusiness(from, { phone: from, step: 'confirm', data: merged }, msgId)
+  if (before.length && listingPhone) {
+    const after = await findBusinessesByPhone(listingPhone)
+    // A failed publish leaves the count unchanged, so only report a real add.
+    if (after.length > before.length) await notifyDuplicateRows(after)
+  }
   await clearSession(from)
 }
 
@@ -2758,6 +2427,26 @@ async function askBatchShop(from: string, batch: ItemBatch, msgId?: string) {
   await sendInteractiveButtons(from, '🧺 Which shop are these items for?', rows, msgId)
 }
 
+/** How many shelf photos for this number are still being read. Meta sends a
+ * fast run as separate concurrent webhooks; the count lets the last one close
+ * the batch only after the slower ones have merged their items. A stale count
+ * (crashed invocation) expires so it cannot block the next batch forever. */
+async function shelfPhotoFlight(from: string, delta: 1 | -1 | 0): Promise<number> {
+  const key = `shelf:flight:${digitsOnly(from)}`
+  return withPhoneLock('shelf-count', from, async () => {
+    let count = 0
+    try {
+      const parsed = JSON.parse((await getBotSetting(key)) || '{}')
+      if (Date.now() - Number(parsed.at || 0) < 90_000) count = Number(parsed.count) || 0
+    } catch {
+      count = 0
+    }
+    count = Math.max(0, count + delta)
+    if (delta !== 0) await setBotSetting(key, JSON.stringify({ count, at: Date.now() }))
+    return count
+  })
+}
+
 /** Add one photo to the shelf batch. Recognition starts on arrival, but the
  * bot stays quiet for 5 seconds after the last photo so a fast 2-5 photo run
  * is analysed as one batch instead of interrupting after each image. */
@@ -2791,93 +2480,140 @@ async function handleShelfBatchImage(
     return
   }
 
-  // Typing indicator stays on while the photo is saved, analysed and while
-  // the 5-second "more photos?" window is open.
-  void markRead(mediaMsgId, true).catch(() => {})
-  const media = await fetchWhatsAppMedia(mediaId)
-  const imageUrl = media ? (await uploadLogoImage(new Uint8Array(media.buffer))) || '' : ''
-  if (!imageUrl) {
-    await sendWhatsAppMessage(from, "I couldn't save that photo. Send a JPG or PNG under 2MB, or reply *done* to continue.", mediaMsgId)
-    return
+  // Count this photo before the slow part (media download + vision), so the
+  // last request to finish knows no other photo from this burst is in flight.
+  await shelfPhotoFlight(from, 1)
+  let counted = true
+
+  // Give up this photo's slot in the burst. When it was the last one in
+  // flight, optionally close the batch after the quiet window.
+  const closeBurst = async (finalizeIfLast: boolean): Promise<void> => {
+    if (!counted) return
+    counted = false
+    const left = await shelfPhotoFlight(from, -1)
+    if (left > 0 || !finalizeIfLast) return
+    const snap = await getSession(from).catch(() => null)
+    const current = snap?.data.itemBatch
+    if (!current || current.phase !== 'collecting' || !current.businessId) return
+    const token = current.batchToken
+    await sleep(SHELF_SETTLE_MS)
+    // A photo arriving during the quiet window takes over the batch.
+    if ((await shelfPhotoFlight(from, 0)) > 0) return
+    const after = await getSession(from).catch(() => null)
+    const now = after?.data.itemBatch
+    if (!now || now.phase !== 'collecting' || now.batchToken !== token) return
+    await finalizeShelfBatch(from, after!, mediaMsgId)
   }
 
-  // Vision runs now, while the seller's next photos are still arriving.
-  const recognised = media ? await recognizeShelfItems(media.buffer, media.mime, caption) : null
+  try {
+    // Typing indicator stays on while the photo is saved, analysed and while
+    // the 5-second "more photos?" window is open.
+    void markRead(mediaMsgId, true).catch(() => {})
+    const media = await fetchWhatsAppMedia(mediaId)
+    const imageUrl = media ? (await uploadLogoImage(new Uint8Array(media.buffer))) || '' : ''
+    if (!imageUrl) {
+      await sendWhatsAppMessage(from, "I couldn't save that photo. Send a JPG or PNG under 2MB, or reply *done* to continue.", mediaMsgId)
+      await closeBurst(true)
+      return
+    }
 
-  // Another photo may have landed during analysis: re-read and merge so the
-  // batch is not lost to a stale session snapshot.
-  const latest = await getSession(from).catch(() => null)
-  const latestBatch = latest?.data.itemBatch
-  if (latestBatch?.phase === 'pricing' || latestBatch?.asking != null) {
-    await sendWhatsAppMessage(from, 'I am already pricing the last batch - finish those prices, then send this photo again.', mediaMsgId)
-    return
+    // Vision runs now, while the seller's next photos are still arriving.
+    const recognised = media ? await recognizeShelfItems(media.buffer, media.mime, caption) : null
+
+    // Another photo may have landed during analysis. Merge under a per-number
+    // lock: four photos arriving together each used to read the same old batch
+    // and overwrite one another, so only the last 1-2 survived.
+    const outcome = await withPhoneLock('shelf-batch', from, async () => {
+      const latest = await getSession(from).catch(() => null)
+      const latestBatch = latest?.data.itemBatch
+      if (latestBatch?.phase === 'pricing' || latestBatch?.asking != null) {
+        return { kind: 'pricing' as const }
+      }
+      const base =
+        (latestBatch?.imageCount || 0) >= (initial?.imageCount || 0) ? latestBatch : initial
+      if ((base?.imageCount || 0) >= SHELF_BATCH_MAX) {
+        return {
+          kind: 'max' as const,
+          session:
+            latest || ({ phone: from, step: 'item_batch', data: { itemBatch: base! } } as ChatSession),
+        }
+      }
+
+      const index = (base?.items.length || 0) + 1
+      const captionName = stripPriceFromCaption(caption)
+      const fallbackItem: ShelfBatchItem = {
+        name: (captionName || `Item ${index}`).slice(0, 60),
+        price: priceFromCaption(caption),
+        imageUrl,
+        nameUnknown: !captionName,
+      }
+      const found = recognised && recognised.length ? recognised : [fallbackItem]
+      const items: ShelfBatchItem[] = [
+        ...(base?.items || []),
+        ...found.map(f => ({
+          name: f.name || 'Unnamed item',
+          price: f.price ?? null,
+          description: f.description || undefined,
+          imageUrl,
+          nameUnknown: f.nameUnknown,
+        })),
+      ]
+      const imageCount = (base?.imageCount || 0) + 1
+
+      const business = base?.businessId
+        ? { id: base.businessId, name: base.businessName }
+        : bizList.length === 1
+          ? { id: bizList[0].id, name: bizList[0].name }
+          : { id: '', name: '' }
+
+      const token = `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`
+      const batch: ItemBatch = {
+        businessId: business.id,
+        businessName: business.name,
+        items,
+        imageCount,
+        phase: 'collecting',
+        lastPhotoAt: Date.now(),
+        batchToken: token,
+      }
+      await saveSession(from, 'item_batch', { itemBatch: batch })
+      console.log(
+        `[shelf-batch] ${from} kept photo ${imageCount}/${SHELF_BATCH_MAX} (${found.length} item${found.length === 1 ? '' : 's'})`
+      )
+      return { kind: 'saved' as const, batch, token }
+    })
+
+    if (outcome.kind === 'pricing') {
+      await sendWhatsAppMessage(from, 'I am already pricing the last batch - finish those prices, then send this photo again.', mediaMsgId)
+      await closeBurst(false)
+      return
+    }
+    if (outcome.kind === 'max') {
+      await closeBurst(false)
+      await finalizeShelfBatch(from, outcome.session, mediaMsgId)
+      return
+    }
+    const batch = outcome.batch
+
+    if (!batch.businessId) {
+      await askBatchShop(from, batch, mediaMsgId)
+      await closeBurst(false)
+      return
+    }
+
+    if ((batch.imageCount || 0) >= SHELF_BATCH_MAX) {
+      await closeBurst(false)
+      await finalizeShelfBatch(from, { phone: from, step: 'item_batch', data: { itemBatch: batch } }, mediaMsgId)
+      return
+    }
+
+    // Only the last photo left in the burst closes the batch, after the quiet
+    // window. A slower photo still in vision finishes its merge first.
+    await closeBurst(true)
+  } finally {
+    // Any error path still gives up the slot, or the next batch would wait.
+    if (counted) await shelfPhotoFlight(from, -1).catch(() => {})
   }
-  const base = latestBatch && (latestBatch.imageCount || 0) > (initial?.imageCount || 0) ? latestBatch : initial
-  if ((base?.imageCount || 0) >= SHELF_BATCH_MAX) {
-    await finalizeShelfBatch(
-      from,
-      latest || { phone: from, step: 'item_batch', data: { itemBatch: base! } },
-      mediaMsgId
-    )
-    return
-  }
-
-  const index = (base?.items.length || 0) + 1
-  const captionName = stripPriceFromCaption(caption)
-  const fallback: ShelfBatchItem = {
-    name: (captionName || `Item ${index}`).slice(0, 60),
-    price: priceFromCaption(caption),
-    imageUrl,
-    nameUnknown: !captionName,
-  }
-  const found = recognised && recognised.length ? recognised : [fallback]
-  const items: ShelfBatchItem[] = [
-    ...(base?.items || []),
-    ...found.map(f => ({
-      name: f.name || 'Unnamed item',
-      price: f.price ?? null,
-      description: f.description || undefined,
-      imageUrl,
-      nameUnknown: f.nameUnknown,
-    })),
-  ]
-  const imageCount = (base?.imageCount || 0) + 1
-
-  const business = base?.businessId
-    ? { id: base.businessId, name: base.businessName }
-    : bizList.length === 1
-      ? { id: bizList[0].id, name: bizList[0].name }
-      : { id: '', name: '' }
-
-  const token = `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`
-  const batch: ItemBatch = {
-    businessId: business.id,
-    businessName: business.name,
-    items,
-    imageCount,
-    phase: 'collecting',
-    lastPhotoAt: Date.now(),
-    batchToken: token,
-  }
-  await saveSession(from, 'item_batch', { itemBatch: batch })
-
-  if (!batch.businessId) {
-    await askBatchShop(from, batch, mediaMsgId)
-    return
-  }
-
-  if (imageCount >= SHELF_BATCH_MAX) {
-    await finalizeShelfBatch(from, { phone: from, step: 'item_batch', data: { itemBatch: batch } }, mediaMsgId)
-    return
-  }
-
-  // Wait out the quiet window. A newer photo replaces batchToken, so this
-  // request bows out and lets the newest one close the batch.
-  await sleep(SHELF_SETTLE_MS)
-  const after = await getSession(from).catch(() => null)
-  const now = after?.data.itemBatch
-  if (!now || now.batchToken !== token || now.phase !== 'collecting') return
-  await finalizeShelfBatch(from, after!, mediaMsgId)
 }
 
 /** Recognised items: list them once, then ask each unpriced item in turn. */
@@ -2908,6 +2644,9 @@ async function finalizeShelfBatch(from: string, session: ChatSession, msgId?: st
 
   if (announce) {
     const photos = batch.imageCount || batch.items.length
+    console.log(
+      `[shelf-batch] ${from} finalised ${photos} photo${photos === 1 ? '' : 's'} -> ${batch.items.length} item${batch.items.length === 1 ? '' : 's'}`
+    )
     await sendWhatsAppMessage(
       from,
       [
@@ -3229,33 +2968,38 @@ async function handleBotMedia(
   from: string,
   session: ChatSession | null,
   message: Record<string, unknown>,
-  mediaMsgId: string
+  mediaMsgId: string,
+  opts: { forceSearch?: boolean } = {}
 ) {
   const kind: MediaKind = message.type === 'audio' ? 'audio' : 'image'
   const blob = message[kind] as { id?: string; caption?: string } | undefined
   const mediaId = blob?.id || ''
   const caption = typeof blob?.caption === 'string' ? blob.caption : ''
 
+  // An agent who picked 🔍 Search item must search, even when their own number
+  // owns a live shop (which would otherwise start a shelf upload).
+  const forceSearch = opts.forceSearch === true
+
   // A supplier asked for a product photo: the next photo from this buyer goes
   // straight back to that shop, not into search.
   const photoRequestId = Number(session?.data.order_photo_request_id)
-  if (kind === 'image' && Number.isFinite(photoRequestId) && photoRequestId > 0) {
+  if (!forceSearch && kind === 'image' && Number.isFinite(photoRequestId) && photoRequestId > 0) {
     await handleOrderPhotoReply(from, session!, mediaId, mediaMsgId, photoRequestId, caption)
     return
   }
 
-  if (kind === 'image' && session?.step === 'order' && session.data.pendingOrder?.groups?.length) {
+  if (!forceSearch && kind === 'image' && session?.step === 'order' && session.data.pendingOrder?.groups?.length) {
     await attachOrderPhoto(from, session, mediaId, mediaMsgId)
     return
   }
 
   // Seller shelf batch: keep collecting (or finish) the 5-photo upload.
-  if (kind === 'image' && session?.step === 'item_batch') {
+  if (!forceSearch && kind === 'image' && session?.step === 'item_batch') {
     await handleShelfBatchImage(from, session, mediaId, caption, mediaMsgId, [])
     return
   }
 
-  const convState = await getConversationState(from)
+  const convState = forceSearch ? null : await getConversationState(from)
   if (convState && convState.state.startsWith('REGISTRATION_') && kind === 'image') {
     // A leftover plan-choice state must not stop the photo from being read.
     if (convState.state === 'REGISTRATION_STARTED' || convState.context?.step === 'choose_plan') {
@@ -3284,7 +3028,7 @@ async function handleBotMedia(
   // Post-activation shelf: a live business owner sending a photo with no flow
   // in progress is most likely stocking their website shop shelf. Photos are
   // batched (up to 5), recognised, then priced one item at a time.
-  if (kind === 'image' && !session) {
+  if (!forceSearch && kind === 'image' && !session) {
     const bizList = await findActiveListingsForPhone(from)
     if (bizList.length > 0) {
       await handleShelfBatchImage(from, null, mediaId, caption, mediaMsgId, bizList)
@@ -3325,7 +3069,7 @@ async function handleBotMedia(
     return
   }
 
-  if (session?.step === 'list_form') {
+  if (!forceSearch && session?.step === 'list_form') {
     // Mid-wizard media: voice answers the question on screen; a photo
     // queues as the logo and the question repeats (or completes the flow
     // when the logo step itself is on screen).
@@ -4523,7 +4267,10 @@ async function relayHeldMessage(
   const payer = digitsOnly(from)
   for (const admin of await adminNumbers()) {
     if (admin === payer) continue
-    await sendWhatsAppMessage(admin, `🤝 *+${payer}* (${cur.step})\n${shown}`)
+    await sendWhatsAppMessage(
+      admin,
+      `🤝 *+${payer}* (${cur.step})\n${shown}\n\nReply: *reply ${payer} your message*`
+    )
   }
   // One-time ack: dashboard-only holds stay silent until the user speaks.
   if (!cur.data.held.notified) {
@@ -4551,8 +4298,77 @@ async function holdChat(adminFrom: string, num: string): Promise<void> {
   )
   await sendWhatsAppMessage(
     adminFrom,
-    `✋ Chat for +${num} is on hold. Their messages now come to you and other admins. Reply *release ${num}* to hand them back to the bot.`
+    `✋ Chat for +${num} is on hold. Their messages now come to you and other admins.\nReply *reply ${num} your message* to answer them, or *release ${num}* to hand them back to the bot.`
   )
+}
+
+/** A held customer asked for a person: keep the flow, tell them, and hand the
+ * transcript to every admin with the commands needed to answer. */
+async function startSupportHandoff(
+  from: string,
+  text: string,
+  session: ChatSession | null,
+  waName: string
+): Promise<void> {
+  const payer = digitsOnly(from)
+  const step = session?.step || 'idle'
+  console.log(`[support] handoff +${payer} from step '${step}'`)
+
+  await saveSession(from, step, {
+    ...(session?.data || {}),
+    held: { at: new Date().toISOString(), notified: true },
+  })
+
+  await sendWhatsAppMessage(
+    from,
+    [
+      '🤝 *Connecting you to our team*',
+      '',
+      'I have held this chat and sent it to an admin. A person will reply here shortly.',
+      'You can keep typing - your messages go straight to them.',
+    ].join('\n')
+  )
+
+  for (const admin of await adminNumbers()) {
+    if (admin === payer) continue
+    await sendWhatsAppMessage(
+      admin,
+      [
+        '🙋 *Help requested - human needed*',
+        `From: +${payer}${waName ? ` (${waName})` : ''}`,
+        `Stage: ${step}`,
+        `Message: "${(text || '').slice(0, 500)}"`,
+        '',
+        'They are on hold. Their next messages also come here.',
+        `Answer them: *reply ${payer} your message*`,
+        `Return them to the bot: *release ${payer}*`,
+      ].join('\n')
+    )
+  }
+}
+
+/** Admin → held customer. The only way to answer without leaving WhatsApp. */
+async function replyAsSupport(adminFrom: string, num: string, message: string): Promise<void> {
+  if (!num || num.length < 9 || num.length > 15) {
+    await sendWhatsAppMessage(adminFrom, 'Send the full number: *reply 263771234567 your message*.')
+    return
+  }
+  const cur = await getSession(num)
+  if (!cur?.data?.held) {
+    await sendWhatsAppMessage(
+      adminFrom,
+      `ℹ️ +${num} is not on hold. Use *hold ${num}* first if you want to take over their chat.`
+    )
+    return
+  }
+  const body = (message || '').trim().slice(0, 3000)
+  if (!body) {
+    await sendWhatsAppMessage(adminFrom, 'Add the message to send: *reply 263771234567 Hello, how can I help?*')
+    return
+  }
+  await sendWhatsAppMessage(num, `💬 *WA Directory support*\n\n${body}`)
+  console.log(`[support] admin reply +${digitsOnly(adminFrom)} -> +${num}`)
+  await sendWhatsAppMessage(adminFrom, `✅ Sent to +${num}.`)
 }
 
 async function releaseChat(adminFrom: string, num: string): Promise<void> {
@@ -4614,125 +4430,18 @@ function parseAdminRewrite(text: string): {
   return { fields, bare, used: true }
 }
 
-/** Resolve an admin-typed category against the approved list. */
-function pickApprovedCategory(
-  approved: Array<{ name: string }>,
-  input: string
-): { name?: string; error?: string } {
-  const wanted = (input || '')
-    .trim()
-    .replace(/^["']|["']$/g, '')
-    .replace(/[.;]$/, '')
-    .trim()
-  if (!wanted) return { error: 'Send a category name.' }
-  const exact = approved.find(c => c.name.toLowerCase() === wanted.toLowerCase())
-  if (exact) return { name: exact.name }
-  const close = approved
-    .filter(c => c.name.toLowerCase().includes(wanted.toLowerCase()) || wanted.toLowerCase().includes(c.name.toLowerCase()))
-    .map(c => c.name)
-    .slice(0, 5)
-  return {
-    error:
-      `*${wanted}* is not an approved category.` +
-      (close.length ? `\nClosest: ${close.join(', ')}` : '') +
-      '\nApprove it first with *approve req <n>*, then connect it.',
-  }
-}
-
-function renderCategoryTree(trees: CategoryTreeNode[], connections: number): string {
-  const lines = [`🌳 *Category tree* - ${connections} connection${connections === 1 ? '' : 's'}`, '']
-  const countNodes = (nodes: CategoryTreeNode[]): number =>
-    nodes.reduce((total, node) => total + 1 + countNodes(node.children), 0)
-  const total = countNodes(trees)
-  const cap = 60
-  let shown = 0
-
-  const walk = (nodes: CategoryTreeNode[], depth: number) => {
-    for (const node of nodes) {
-      if (shown >= cap) return
-      shown++
-      lines.push(depth === 0 ? `*${node.name}*` : `${'  '.repeat(depth)}└ ${node.name}`)
-      walk(node.children, depth + 1)
-    }
-  }
-  walk(trees, 0)
-  if (total > shown) lines.push(`… and ${total - shown} more`)
-  return lines.join('\n')
-}
-
-// The tree message carries the actions, so an admin can connect or disconnect
-// a branch without typing the command syntax.
-async function showAdminCategoryTree(from: string) {
-  const tree = await categoryTree()
-  const current = await getSession(from)
-  await saveSession(from, 'admin_tree', {
-    ...(current?.data || {}),
-    treeConnectChild: undefined,
-    treeConnectParent: undefined,
-    treeLinks: undefined,
-    treeLink: undefined,
-  })
-
-  if (!tree.connections) {
-    await sendInteractiveButtons(
-      from,
-      '🌳 *Category tree*\n\nNo category connections yet. Connect a child category to a parent and buyers searching either name will see both.',
-      [{ id: 'tree_connect', title: '🔗 Connect branch' }]
-    )
-    return
-  }
-
-  const body = `${renderCategoryTree(tree.trees, tree.connections)}\n\nConnect or disconnect a branch:`
-  const buttons: InteractiveButton[] = [
-    { id: 'tree_connect', title: '🔗 Connect' },
-    { id: 'tree_disconnect', title: '✂️ Disconnect' },
-    { id: 'tree_done', title: '✖ Close' },
-  ]
-  if (body.length <= 1000) {
-    await sendInteractiveButtons(from, body, buttons)
-  } else {
-    await sendWhatsAppMessage(from, body)
-    await sendInteractiveButtons(from, 'Connect or disconnect a branch:', buttons)
-  }
-}
-
-async function finishTreeConnect(from: string, session: ChatSession | null): Promise<void> {
-  const child = session?.data.treeConnectChild
-  const parent = session?.data.treeConnectParent
-  if (!child || !parent) {
-    await clearSession(from)
-    await sendWhatsAppMessage(from, '⌛ That connection expired. Send *category tree* to start again.')
-    return
-  }
-  const linked = await linkCategories(child, parent)
-  if (!linked.ok) {
-    await sendWhatsAppMessage(from, `⚠️ ${linked.error || 'Could not connect those categories.'}`)
-    return
-  }
-  await clearSession(from)
-  await sendWhatsAppMessage(from, `🔗 *${child}* is now an element of *${parent}*.`)
-  await showAdminCategoryTree(from)
-}
-
-async function finishTreeDisconnect(from: string, session: ChatSession | null): Promise<void> {
-  const link = session?.data.treeLink
-  if (!link) {
-    await clearSession(from)
-    await sendWhatsAppMessage(from, '⌛ That connection expired. Send *category tree* to start again.')
-    return
-  }
-  const removed = await unlinkCategory(link.raw)
-  if (!removed.ok) {
-    await sendWhatsAppMessage(from, `⚠️ ${removed.error || 'Could not remove that connection.'}`)
-    return
-  }
-  await clearSession(from)
-  await sendWhatsAppMessage(
-    from,
-    `✂️ *${link.child}* is no longer under *${link.parent}*. Searching either name keeps its own results.`
-  )
-  await showAdminCategoryTree(from)
-}
+// The interactive category tree lives in lib/admin-category-tree.ts; the
+// webhook only wires its senders and session store.
+const adminTree = createAdminCategoryTree({
+  sendText: (to, body) => sendWhatsAppMessage(to, body),
+  sendButtons: (to, body, buttons) => sendInteractiveButtons(to, body, buttons),
+  getSession,
+  saveSession: (phone, step, data) => saveSession(phone, step, data),
+  clearSession,
+})
+const showAdminCategoryTree = adminTree.show
+const finishTreeConnect = adminTree.finishConnect
+const finishTreeDisconnect = adminTree.finishDisconnect
 
 function rewriteSummary(changed: string[]): string {
   return changed.length ? changed.join(' · ') : 'nothing changed'
@@ -4856,35 +4565,331 @@ async function rewriteFeatureRequest(
   return { ok: true, changed, name: requestName, categoryTarget: fields.category }
 }
 
+// ── Field agents ────────────────────────────────────────────────────────
+// Agents add businesses for other people and nothing else. They are not
+// admins, so they never receive submission/approval notices.
+
+async function promptOwnerNumber(
+  from: string,
+  agent: boolean,
+  pending?: ChatSessionData['pendingAgentMedia']
+): Promise<void> {
+  await clearConversationState(from)
+  await saveSession(from, 'admin_add_business', {
+    addingBusiness: true,
+    ...(pending?.id ? { pendingAgentMedia: pending } : {}),
+  } as ChatSessionData)
+  await sendWhatsAppMessage(
+    from,
+    [
+      agent ? '👥 *Add a business for an owner*' : '🏬 *Add another business*',
+      '',
+      pending?.id
+        ? 'Photo received 👍 Send the WhatsApp number that will *own* this listing and I will read the sign straight away.'
+        : 'Send the WhatsApp number that will *own* this listing (e.g. 0771234567).',
+      agent
+        ? 'Their number owns the portal and receives every cart/order reply. The hand-over card goes to our admins to forward - you get a short confirmation.'
+        : 'Their number owns the portal and receives cart/order replies; the success card comes back to you to forward.',
+      '',
+      'Type *cancel* to stop.',
+    ].join('\n')
+  )
+}
+
+const AGENT_HELP = [
+  '👥 *Agent mode*',
+  '',
+  'You can add businesses for other people. They keep their own number, portal and customer replies.',
+  '',
+  'Send *register* to start. Photographing the business sign is fastest - the AI reads the name, category, phone, town and description.',
+  'You can also send any photo and choose whether to register it as a business or search the directory for it.',
+].join('\n')
+
+/** A photo from an agent could be a sign to register or an item to find. Ask
+ * once and keep the photo, so neither reading happens by accident. */
+async function promptAgentPhotoChoice(
+  from: string,
+  media: NonNullable<ChatSessionData['pendingAgentMedia']>
+): Promise<void> {
+  await clearConversationState(from)
+  await saveSession(from, 'agent_photo_choice', {
+    pendingAgentMedia: media,
+  } as ChatSessionData)
+  await sendInteractiveButtons(
+    from,
+    [
+      '📷 *Photo received - what should I do with it?*',
+      '',
+      'Register the business shown in the photo, or search the directory for what it shows?',
+    ].join('\n'),
+    [
+      { id: 'agent_photo_register', title: '🏪 Register business' },
+      { id: 'agent_photo_search', title: '🔍 Search item' },
+    ]
+  )
+}
+
+/** The owner-number step shared by admins and agents. */
+async function handleOwnerNumberEntry(
+  from: string,
+  text: string,
+  session: ChatSession | null
+): Promise<boolean> {
+  if (session?.step !== 'admin_add_business') return false
+  const clean = text.trim()
+  if (!clean) return false
+
+  if (/^cancel$/i.test(clean)) {
+    await resetForNewSearch(from, session)
+    await sendWhatsAppMessage(from, '✖ Cancelled. Nothing was added.')
+    return true
+  }
+
+  const owner = normalizeRegistrationOwner(clean)
+  if (owner.length < 10 || owner.length > 15) {
+    await sendWhatsAppMessage(
+      from,
+      'Send the owner\'s WhatsApp number in international or local form (e.g. 0771234567 or 263771234567), or type *cancel*.'
+    )
+    return true
+  }
+
+  // A second listing on an existing number is the owner's decision only. This
+  // is the check that stops agents photographing the same sign twice.
+  const existing = await findBusinessesByPhone(owner)
+  if (existing.length) {
+    await sendInteractiveButtons(
+      from,
+      [
+        '⚠️ *That number is already listed*',
+        '',
+        ...duplicateBusinessLines(existing),
+        '',
+        'Only the owner can add a second listing on the same number. Ask them to register it themselves from their own WhatsApp.',
+        '',
+        'If the sign shows a different number, send that number instead.',
+        '',
+        'Nothing was added.',
+      ].join('\n'),
+      [
+        { id: 'reg_owner_retry', title: '☎️ Another number' },
+        { id: 'reg_cancel', title: '✖ Cancel' },
+      ]
+    )
+    return true
+  }
+
+  const pending = session?.data.pendingAgentMedia
+  await resetForNewSearch(from, session)
+  await startImageFirstRegister(from, { onBehalfOf: owner })
+  if (pending?.id) {
+    const media = await fetchWhatsAppMedia(pending.id)
+    if (media) {
+      await handleRegistrationImageResilient(
+        from,
+        new Uint8Array(media.buffer),
+        pending.caption || ''
+      )
+    } else {
+      await sendWhatsAppMessage(
+        from,
+        "I couldn't open that photo again. Send it once more as a photo, or reply *skip* to enter the details by hand."
+      )
+    }
+  }
+  return true
+}
+
+/** Agent-only gate: outside an open registration, every message is redirected
+ * to "add a business for someone". */
+async function handleAgentTurn(
+  from: string,
+  session: ChatSession | null,
+  text: string,
+  action: string,
+  media?: { id: string; caption: string; messageId: string } | null
+): Promise<boolean> {
+  if (session?.step === 'admin_add_business') {
+    if (media?.id) {
+      // A new photo replaces the one waiting for the owner number.
+      await promptOwnerNumber(from, true, media)
+      return true
+    }
+    if (!text) {
+      await sendWhatsAppMessage(from, "Send the owner's WhatsApp number first, e.g. *0771234567*.")
+      return true
+    }
+    return handleOwnerNumberEntry(from, text, session)
+  }
+
+  const conv = await getConversationState(from)
+  const inRegistration =
+    !!conv?.state?.startsWith('REGISTRATION_') || session?.step === 'list_form'
+  if (inRegistration) return false
+
+  if (action) {
+    if (action === 'agent_photo_register') {
+      await promptOwnerNumber(from, true, session?.data.pendingAgentMedia)
+      return true
+    }
+    if (action === 'agent_photo_search') {
+      const pending = session?.data.pendingAgentMedia
+      await clearSession(from)
+      await clearConversationState(from)
+      if (!pending?.id) {
+        await sendWhatsAppMessage(from, 'That photo is no longer waiting. Send it again and I will search for it.')
+        return true
+      }
+      await handleBotMedia(
+        from,
+        null,
+        { type: 'image', image: { id: pending.id, caption: pending.caption || '' } },
+        pending.messageId || '',
+        { forceSearch: true }
+      )
+      return true
+    }
+    if (
+      action === 'menu_register' ||
+      action === 'reg_business' ||
+      action === 'reg_for_other' ||
+      action === 'reg_restart' ||
+      action === 'reg_upload' ||
+      action === 'reg_skip' ||
+      action === 'reg_plan_trial' ||
+      action === 'reg_plan_paid'
+    ) {
+      await promptOwnerNumber(from, true)
+      return true
+    }
+    if (action === 'reg_duplicate_photo') {
+      const owner =
+        typeof conv?.context?.onBehalfOf === 'string'
+          ? normalizeRegistrationOwner(conv.context.onBehalfOf)
+          : ''
+      if (owner) await startImageFirstRegister(from, { onBehalfOf: owner })
+      else await promptOwnerNumber(from, true)
+      return true
+    }
+    if (action === 'reg_owner_retry') {
+      await promptOwnerNumber(from, true)
+      return true
+    }
+    if (action === 'reg_cancel' || action === 'cancel') {
+      await clearSession(from)
+      await clearConversationState(from)
+      await sendWhatsAppMessage(from, '✖ Cancelled. Send *register* to add a business for an owner.')
+      return true
+    }
+    await sendWhatsAppMessage(from, AGENT_HELP)
+    return true
+  }
+
+  // A photo with no clear command could be a sign to register or an item to
+  // search. Never guess: keep it and ask with two buttons.
+  if (media?.id) {
+    await promptAgentPhotoChoice(from, media)
+    return true
+  }
+
+  if (text && registrationCommand(text)) {
+    await promptOwnerNumber(from, true)
+    return true
+  }
+  if (text && /^(?:add|list)\s+(?:a\s+)?(?:new\s+)?business$/i.test(text.trim())) {
+    await promptOwnerNumber(from, true)
+    return true
+  }
+  if (text && /^(?:cancel|stop)$/i.test(text.trim())) {
+    await clearSession(from)
+    await clearConversationState(from)
+    await sendWhatsAppMessage(from, '✖ Cancelled. Send *register* to add a business for an owner.')
+    return true
+  }
+
+  if (text) await sendWhatsAppMessage(from, AGENT_HELP)
+  return true
+}
+
 async function handleAdminCommand(from: string, text: string): Promise<boolean> {
   const clean = text.trim()
   const lower = clean.toLowerCase()
 
-  // ── Add a business on someone else's behalf ──────────────────────────
-  // Admins (and owners) can list a business they do not own. The system asks
-  // for the number that will own it, then runs the SAME registration flow on
-  // the admin's chat with that number on the listing — so control of the
-  // listing, its portal and every cart/order reply sits with the owner, while
-  // the success message comes back to the admin to forward.
-  const adminSession = await getSession(from)
-  if (adminSession?.step === 'admin_add_business') {
-    if (lower === 'cancel') {
-      await resetForNewSearch(from, adminSession)
-      await sendWhatsAppMessage(from, '✖ Cancelled. Nothing was added.')
-      return true
-    }
-    const owner = normalizeRegistrationOwner(clean)
-    if (owner.length < 10 || owner.length > 15) {
+  // One menu for the whole admin suite: taps become the typed command below.
+  if (lower === 'admin' || lower === 'admin menu' || lower === 'admin help') {
+    const agents = await agentNumbers()
+    await sendInteractiveList(from, adminMenuBody(agents.length), ADMIN_MENU_ROWS, ADMIN_MENU_BUTTON)
+    return true
+  }
+
+  // ── Field agents (admin-only) ────────────────────────────────────────
+  if (lower === 'agents' || lower === 'agent list') {
+    const agents = await agentNumbers()
+    if (!agents.length) {
       await sendWhatsAppMessage(
         from,
-        'Send the owner\'s WhatsApp number in international or local form (e.g. 0771234567 or 263771234567), or type *cancel*.'
+        [
+          '👥 *Field agents*',
+          '',
+          'No agents yet. An agent can only add businesses for other people, and never gets approval notices.',
+          '',
+          'Add one: *add agent 0771234567*',
+        ].join('\n')
       )
       return true
     }
-    await resetForNewSearch(from, adminSession)
-    await startImageFirstRegister(from, { onBehalfOf: owner })
+    await sendWhatsAppMessage(
+      from,
+      [
+        `👥 *Field agents* (${agents.length})`,
+        '',
+        ...agents.map((number, index) => `${index + 1}. +${number}`),
+        '',
+        'Agents only add businesses for owners; they receive no approval notices.',
+        'Add: *add agent 0771234567* · Remove: *remove agent 0771234567*',
+      ].join('\n')
+    )
     return true
   }
+
+  const addAgentMatch = clean.match(/^(?:add|new)\s+(?:an?\s+)?agent\s+(.+)$/i)
+  if (addAgentMatch) {
+    const result = await addAgent(addAgentMatch[1])
+    await sendWhatsAppMessage(
+      from,
+      result.ok
+        ? [
+            `✅ *Agent added* · +${result.number}`,
+            '',
+            'They can now send *register* to add a business for an owner. Their number is on the agent list only - they do not receive approval or verification notices.',
+          ].join('\n')
+        : `⚠️ ${result.error}`
+    )
+    return true
+  }
+
+  const removeAgentMatch = clean.match(/^(?:remove|del(?:ete)?)\s+(?:an?\s+)?agent\s+(.+)$/i)
+  if (removeAgentMatch) {
+    const result = await removeAgent(removeAgentMatch[1])
+    await sendWhatsAppMessage(
+      from,
+      result.ok
+        ? `🗑️ Agent removed · +${result.number}. They can no longer add businesses for owners.`
+        : `⚠️ ${result.error}`
+    )
+    return true
+  }
+
+  if (/^(?:add|new)\s+(?:an?\s+)?agent\b/i.test(clean)) {
+    await sendWhatsAppMessage(from, 'Usage: *add agent 0771234567*')
+    return true
+  }
+  if (/^(?:remove|del(?:ete)?)\s+(?:an?\s+)?agent\b/i.test(clean)) {
+    await sendWhatsAppMessage(from, 'Usage: *remove agent 0771234567* (see *agents* for the list)')
+    return true
+  }
+
+  const adminSession = await getSession(from)
 
   // Guided connect from the interactive category tree. Only typed answers are
   // handled here: a button tap arrives as an empty message and must fall
@@ -5175,6 +5180,17 @@ async function handleAdminCommand(from: string, text: string): Promise<boolean> 
     }
     const num = digitsOnly(clean.slice(8).trim())
     await releaseChat(from, num)
+    return true
+  }
+
+  // Answer a held customer without leaving WhatsApp.
+  const supportReply = clean.match(/^(?:reply|respond|say)\s+(\+?\d{9,15})\s+([\s\S]+)$/i)
+  if (supportReply) {
+    if (!(await isBotAdmin(from))) {
+      await sendWhatsAppMessage(from, '🔒 This command is for administrators only.')
+      return true
+    }
+    await replyAsSupport(from, digitsOnly(supportReply[1]), supportReply[2])
     return true
   }
 
@@ -7121,6 +7137,19 @@ async function handleAction(from: string, session: ChatSession | null, action: s
       await startImageFirstRegister(from)
       return
     }
+    case 'reg_duplicate_photo': {
+      const convState = await getConversationState(from)
+      const owner =
+        typeof convState?.context?.onBehalfOf === 'string'
+          ? normalizeRegistrationOwner(convState.context.onBehalfOf)
+          : ''
+      if (owner) await startImageFirstRegister(from, { onBehalfOf: owner })
+      else await startImageFirstRegister(from)
+      return
+    }
+    case 'reg_owner_retry':
+      await promptOwnerNumber(from, await isAgent(from))
+      return
     case 'reg_cancel':
       await clearConversationState(from)
       await clearSession(from)
@@ -9554,18 +9583,62 @@ export async function POST(request: Request) {
         // open: treat it as no active step — the draft itself is read from the
         // DB by resumePaused / stashPaused.
         if (session?.step === 'idle') session = null
+        const fromIsAdmin = await isBotAdmin(from)
+
+        // ── Human takeover gate ─────────────────────────────────────────
+        // Held sessions relay inbound messages to the admins instead of
+        // driving bot flows, whatever step the chat was on when it was held.
+        // stop-opt-out was handled before this point, so an admin hold never
+        // blocks opt-out. contactSession (not session) is used because
+        // idle-step rows are nulled just above.
+        if (contactSession?.data?.held) {
+          await relayHeldMessage(from, text, action, mediaKind, location)
+          continue
+        }
+
+        // A request for a person holds the chat and alerts the admins. This
+        // sits before every flow (and before the agent gate) so "help"
+        // mid-registration still reaches a human instead of cancelling.
+        if (!fromIsAdmin && text && isSupportRequest(text)) {
+          await startSupportHandoff(from, text, session || contactSession, waName)
+          continue
+        }
+
+        // ── Field agents: register other people's businesses only ──────
+        // They are checked before the admin suite: an agent is never an
+        // admin, so they get no notices and no other commands.
+        if (!fromIsAdmin && (await isAgent(from))) {
+          const agentPhoto =
+            mediaKind === 'image' && inboundMediaId
+              ? {
+                  id: inboundMediaId,
+                  caption: String(
+                    (message.image as { caption?: string } | undefined)?.caption || ''
+                  ),
+                  messageId: msgId,
+                }
+              : null
+          if (await handleAgentTurn(from, session, text, action, agentPhoto)) continue
+        }
 
         // ── Admin command suite (owner + allowlisted numbers) ───────────
-        if (await isBotAdmin(from)) {
+        if (fromIsAdmin) {
+          // The owner-number step belongs to both admins and agents.
+          if (session?.step === 'admin_add_business' && text) {
+            if (await handleOwnerNumberEntry(from, text, session)) continue
+          }
           // A tapped admin button carries its command in the id, so treat the
           // tap exactly like the typed line it stands for. Only our own admin
           // button ids are routed this way: other taps (menus, bids) must not
           // collide with commands like "reset" or "hold".
-          const adminTap = /^(?:verify|unverify|trial|pending|requests|reqs|approve req|reject req|connect req)\b/i.test(
-            action
-          )
-            ? action
-            : ''
+          const menuCommand = adminMenuCommand(action)
+          const adminTap =
+            menuCommand ||
+            (/^(?:verify|unverify|trial|pending|requests|reqs|approve req|reject req|connect req)\b/i.test(
+              action
+            )
+              ? action
+              : '')
           if (await handleAdminCommand(from, text || adminTap)) {
             continue
           }
@@ -9624,16 +9697,6 @@ export async function POST(request: Request) {
             continue
           }
           await relayOrderNote(from, session, text)
-          continue
-        }
-
-        // ── Human takeover gate ─────────────────────────────────────────
-        // Held sessions relay inbound messages to the admins instead of
-        // driving bot flows. stop-opt-out was handled before this point,
-        // so an admin hold never blocks opt-out. contactSession (not
-        // session) is used because idle-step rows are nulled further down.
-        if (contactSession?.data?.held) {
-          await relayHeldMessage(from, text, action, mediaKind, location)
           continue
         }
 

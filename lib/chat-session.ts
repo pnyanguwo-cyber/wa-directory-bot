@@ -39,6 +39,9 @@ export interface ChatSessionData {
   // Step 'admin_add_business': an admin is keying in the number that will own
   // a listing added for someone else.
   addingBusiness?: boolean
+  // A photo sent before the owner number was known. It is read as soon as the
+  // number arrives, so an agent does not have to send it twice.
+  pendingAgentMedia?: { id: string; caption?: string; messageId?: string }
   // Interactive category tree (admin): guided connect inputs and the
   // connection picked from the ✂️ disconnect list. `treeLink` is resolved from
   // `treeLinks` the moment a row is tapped, so an expired list cannot act on
