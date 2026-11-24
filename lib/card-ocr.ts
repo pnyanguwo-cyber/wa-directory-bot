@@ -1,4 +1,5 @@
 import { callGeminiJson, prepareImageForAnalysis } from '@wa-directory/shared'
+import { callVisionJson } from './vision-fallback.js'
 
 /**
  * Fast business-card reader.
@@ -99,7 +100,17 @@ export async function extractBusinessCardFast(
       timeoutMs: 8_000,
     }
   )
-  return normalizeFastCard(raw)
+
+  let parsed: unknown = raw
+  if (!parsed) {
+    parsed = await callVisionJson(
+      `${prompt}\n\nReturn JSON only.`,
+      [{ bytes: Buffer.from(prepared.base64, 'base64'), mime: prepared.mimeType }],
+      15_000
+    )
+  }
+  if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return null
+  return normalizeFastCard(parsed)
 }
 
 export function hasRequiredCardField(fields: FastCardFields | null): boolean {
