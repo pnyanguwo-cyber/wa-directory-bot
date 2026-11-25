@@ -113,8 +113,10 @@ person`, `real person`, `customer care`, Shona/Ndebele equivalents, or a
 complaint put the chat on hold (`chat_sessions.data.held`) and alert every
 admin with the stage and message. The customer's next messages relay to the
 admins instead of the bot. Admins answer with `reply 263771234567 your message`
-and return the chat with `release 263771234567`. Detection lives in
-`lib/support-intent.ts`; `help me find a plumber` stays a search.
+and return the chat with `release 263771234567`. Admins get the same handover
+for an explicit ask such as `I need help` (a bare `help` still opens the admin
+guide), and can type just `release` to free their own held chat. Detection
+lives in `lib/support-intent.ts`; `help me find a plumber` stays a search.
 
 **Photo bursts:** Meta delivers a fast run of photos as separate, concurrent
 webhooks. Shelf batches merge under a per-number lock in `lib/phone-lock.ts`
