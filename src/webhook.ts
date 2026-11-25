@@ -4319,20 +4319,18 @@ async function startSupportHandoff(
     held: { at: new Date().toISOString(), notified: true },
   })
 
-  const admins = (await adminNumbers()).filter(admin => admin !== payer)
   await sendWhatsAppMessage(
     from,
     [
       '🤝 *Connecting you to our team*',
       '',
-      admins.length
-        ? 'I have held this chat and sent it to an admin. A person will reply here shortly.'
-        : 'This chat is on hold, but no other admin is configured on this bot. Send *release* to hand it back to the bot.',
-      admins.length ? 'You can keep typing - your messages go straight to them.' : '',
-    ].filter(Boolean).join('\n')
+      'I have held this chat and sent it to an admin. A person will reply here shortly.',
+      'You can keep typing - your messages go straight to them.',
+    ].join('\n')
   )
 
-  for (const admin of admins) {
+  for (const admin of await adminNumbers()) {
+    if (admin === payer) continue
     await sendWhatsAppMessage(
       admin,
       [
@@ -5180,12 +5178,7 @@ async function handleAdminCommand(from: string, text: string): Promise<boolean> 
       await sendWhatsAppMessage(from, '🔒 This command is for administrators only.')
       return true
     }
-    let num = digitsOnly(clean.slice(8).trim())
-    // An admin on a held chat can type just `release` to free their own chat.
-    if (!num) {
-      const own = await getSession(from)
-      if (own?.data?.held) num = digitsOnly(from)
-    }
+    const num = digitsOnly(clean.slice(8).trim())
     await releaseChat(from, num)
     return true
   }
@@ -9598,23 +9591,24 @@ export async function POST(request: Request) {
         // stop-opt-out was handled before this point, so an admin hold never
         // blocks opt-out. contactSession (not session) is used because
         // idle-step rows are nulled just above.
+        // Admin numbers always stay on the bot: never put the owner or an
+        // admin on hold, even if they typed a support phrase while testing.
+        // Clear any hold left on an admin chat by an older build.
+        if (fromIsAdmin && contactSession?.data?.held) {
+          await saveSession(from, contactSession.step, { ...contactSession.data, held: undefined })
+          contactSession.data.held = undefined
+        }
         if (contactSession?.data?.held) {
-          // Admins can still run the commands that manage the hold (notably
-          // `release`), even when the held chat is their own.
-          if (!fromIsAdmin || !/^(?:release|reply|respond|say|hold|admin)\b/i.test(text)) {
-            await relayHeldMessage(from, text, action, mediaKind, location)
-            continue
-          }
+          await relayHeldMessage(from, text, action, mediaKind, location)
+          continue
         }
 
         // A request for a person holds the chat and alerts the admins. This
         // sits before every flow (and before the agent gate) so "help"
         // mid-registration still reaches a human instead of cancelling.
-        // Admins get the same handover for a real ask ("I need help"), but a
-        // bare `help` stays the admin help command instead of holding their
-        // own chat and locking them out of the bot.
-        const adminHelpCommand = /^(?:help|help me|support|assistance|assist me)[\s.!]*$/i.test(text)
-        if (text && isSupportRequest(text) && (!fromIsAdmin || !adminHelpCommand)) {
+        // Admins are excluded: they are the people who answer, and holding an
+        // admin chat would lock the owner out of the bot.
+        if (!fromIsAdmin && text && isSupportRequest(text)) {
           await startSupportHandoff(from, text, session || contactSession, waName)
           continue
         }
